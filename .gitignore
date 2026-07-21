@@ -1,0 +1,10 @@
+# Personal learning notes — deep-dive write-ups kept for my own study,
+# not polished for public presentation. See ROADMAP.md's "Documentation
+# conventions" section.
+*_NOTES.md
+
+# Rust build artifacts, per stage
+target/
+
+# AOF files produced by running stage 8+ locally
+*.aof
