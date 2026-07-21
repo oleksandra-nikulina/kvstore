@@ -74,8 +74,13 @@ impl PubSub {
         }
     }
 
-    #[cfg(test)]
-    fn channel_count(&self) -> usize {
+    /// How many channels currently have a broadcast group in the
+    /// registry (i.e. have, or very recently had, at least one live
+    /// subscriber). Mainly for tests and introspection — not part of
+    /// the client-facing protocol (real Redis exposes the equivalent of
+    /// this via `PUBSUB CHANNELS`/`PUBSUB NUMSUB`, which this project
+    /// doesn't implement).
+    pub fn channel_count(&self) -> usize {
         self.channels.lock().unwrap().len()
     }
 }

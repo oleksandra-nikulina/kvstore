@@ -43,8 +43,20 @@ pub async fn handle_connection(
     // forever. Running this once, after `serve` returns by any path
     // (instead of duplicating cleanup at every early return inside it),
     // is the whole reason `serve` is a separate function.
+    //
+    // `abort()` only *requests* cancellation — the task (and the
+    // `broadcast::Receiver` it owns) isn't actually torn down until the
+    // runtime next polls it, so `receiver_count()` can still read >0
+    // for an instant afterward. `cleanup_if_unused` would then wrongly
+    // see the channel as still in use and leave its (now genuinely
+    // dead) entry in the map forever. Awaiting the handle blocks until
+    // the task has actually finished unwinding — its `Receiver` is
+    // dropped as part of that — so `cleanup_if_unused` sees an accurate
+    // count. (Found by code review: `receiver_count()` read 1, not 0,
+    // immediately after a bare `abort()`.)
     for (channel, handle) in subscriptions.drain() {
         handle.abort();
+        let _ = handle.await;
         pubsub.cleanup_if_unused(&channel);
     }
 
@@ -162,7 +174,11 @@ async fn dispatch(
             } else {
                 for channel in targets {
                     if let Some(handle) = subscriptions.remove(&channel) {
+                        // See the matching comment in `handle_connection`
+                        // for why `cleanup_if_unused` has to wait for the
+                        // aborted task to actually finish first.
                         handle.abort();
+                        let _ = handle.await;
                         pubsub.cleanup_if_unused(&channel);
                     }
                     let reply = subscribe_ack("unsubscribe", Some(&channel), subscriptions.len());

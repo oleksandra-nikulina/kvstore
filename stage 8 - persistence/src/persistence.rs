@@ -72,6 +72,24 @@ impl Aof {
     /// throughput. This stage doesn't implement either — worth knowing
     /// it's missing, not worth the added complexity to fix for a
     /// learning-scope project.
+    ///
+    /// Two more durability gaps worth naming rather than leaving
+    /// implicit (found in review, not fixed — see the project's
+    /// `REVIEW_NOTES.md`): if the file write below fails, the store
+    /// mutation above has *already happened* and the client still gets
+    /// a normal success reply — there's no rollback and no client-visible
+    /// signal that persistence failed, only a server-side `eprintln!`.
+    /// And if a write fails *partially* (some bytes land, then an error
+    /// — possible on e.g. `ENOSPC`) and a later write then succeeds, the
+    /// log ends up with a corrupt entry in the *middle* rather than at
+    /// the very end; `replay` only knows how to stop cleanly at a bad
+    /// *trailing* entry, so everything logged after a mid-file
+    /// corruption would be silently dropped on the next restart, even
+    /// though it was genuinely written and acknowledged. Both are real,
+    /// narrow edge cases rather than everyday risk — recovering from
+    /// either properly would mean tracking a known-good offset and
+    /// truncating to it, which is real complexity for a failure mode
+    /// this project's learning goals don't require covering.
     pub async fn execute_and_log(&self, command: &Command, args: &[Bytes], store: &Store) -> Reply {
         let mut file = self.file.lock().await;
         let reply = execute(command, store);

@@ -16,16 +16,23 @@ fn temp_aof_path(label: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(format!("kvstore-stage9-test-{label}-{nanos}.aof"))
 }
 
-async fn spawn_server() -> SocketAddr {
+/// Returns the server's address plus a handle to its `PubSub` registry
+/// — most tests only need the address, but a couple inspect
+/// `channel_count()` directly to prove a channel's broadcast group was
+/// actually removed, not just infer it indirectly from `PUBLISH`'s
+/// reply (which reads `0` whenever there are no live receivers,
+/// regardless of whether the map entry itself was ever cleaned up).
+async fn spawn_server() -> (SocketAddr, Arc<PubSub>) {
     let path = temp_aof_path("server");
     let store = Arc::new(Store::new());
     let aof = Arc::new(Aof::open(&path).await.unwrap());
     let pubsub = Arc::new(PubSub::new());
+    let server_pubsub = Arc::clone(&pubsub);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { run(listener, store, aof, pubsub).await.unwrap() });
-    addr
+    tokio::spawn(async move { run(listener, store, aof, server_pubsub).await.unwrap() });
+    (addr, pubsub)
 }
 
 async fn connect(addr: SocketAddr) -> TcpStream {
@@ -114,7 +121,7 @@ async fn settle() {
 
 #[tokio::test]
 async fn a_single_subscriber_receives_a_published_message() {
-    let addr = spawn_server().await;
+    let (addr, _pubsub) = spawn_server().await;
 
     let mut subscriber = connect(addr).await;
     send(&mut subscriber, &[b"SUBSCRIBE", b"news"]).await;
@@ -139,7 +146,7 @@ async fn a_single_subscriber_receives_a_published_message() {
 
 #[tokio::test]
 async fn publish_to_a_channel_with_no_subscribers_replies_zero() {
-    let addr = spawn_server().await;
+    let (addr, _pubsub) = spawn_server().await;
     let mut stream = connect(addr).await;
     send(&mut stream, &[b"PUBLISH", b"nobody-listening", b"hi"]).await;
     assert_eq!(read_reply(&mut stream).await, b":0\r\n");
@@ -151,7 +158,7 @@ async fn publish_to_a_channel_with_no_subscribers_replies_zero() {
 /// subscriber gets every message).
 #[tokio::test(flavor = "multi_thread")]
 async fn many_concurrent_subscribers_all_receive_the_same_published_message() {
-    let addr = spawn_server().await;
+    let (addr, _pubsub) = spawn_server().await;
     let subscriber_count = 20;
 
     let mut subscribers = Vec::new();
@@ -180,7 +187,7 @@ async fn many_concurrent_subscribers_all_receive_the_same_published_message() {
 
 #[tokio::test]
 async fn a_connection_can_subscribe_to_multiple_channels_and_gets_both() {
-    let addr = spawn_server().await;
+    let (addr, _pubsub) = spawn_server().await;
 
     let mut subscriber = connect(addr).await;
     send(&mut subscriber, &[b"SUBSCRIBE", b"news", b"sports"]).await;
@@ -213,7 +220,7 @@ async fn a_connection_can_subscribe_to_multiple_channels_and_gets_both() {
 
 #[tokio::test]
 async fn unsubscribe_stops_further_delivery() {
-    let addr = spawn_server().await;
+    let (addr, pubsub) = spawn_server().await;
 
     let mut subscriber = connect(addr).await;
     send(&mut subscriber, &[b"SUBSCRIBE", b"news"]).await;
@@ -225,7 +232,12 @@ async fn unsubscribe_stops_further_delivery() {
         b"*3\r\n$11\r\nunsubscribe\r\n$4\r\nnews\r\n:0\r\n"
     );
 
-    settle().await;
+    // dispatch() now awaits the aborted forwarder task before sending
+    // this ack, so receiving it already proves the registry was
+    // cleaned up — no settle() needed for this path (unlike the
+    // disconnect-cleanup test, which has no equivalent "cleanup done"
+    // signal to wait on).
+    assert_eq!(pubsub.channel_count(), 0);
 
     let mut publisher = connect(addr).await;
     send(&mut publisher, &[b"PUBLISH", b"news", b"too late"]).await;
@@ -242,7 +254,7 @@ async fn unsubscribe_stops_further_delivery() {
 
 #[tokio::test]
 async fn unsubscribe_with_no_arguments_leaves_all_channels() {
-    let addr = spawn_server().await;
+    let (addr, _pubsub) = spawn_server().await;
 
     let mut subscriber = connect(addr).await;
     send(&mut subscriber, &[b"SUBSCRIBE", b"a", b"b", b"c"]).await;
@@ -263,7 +275,7 @@ async fn unsubscribe_with_no_arguments_leaves_all_channels() {
 
 #[tokio::test]
 async fn unsubscribe_with_nothing_subscribed_still_sends_one_null_ack() {
-    let addr = spawn_server().await;
+    let (addr, _pubsub) = spawn_server().await;
     let mut stream = connect(addr).await;
     send(&mut stream, &[b"UNSUBSCRIBE"]).await;
     assert_eq!(
@@ -274,7 +286,7 @@ async fn unsubscribe_with_nothing_subscribed_still_sends_one_null_ack() {
 
 #[tokio::test]
 async fn most_commands_are_rejected_while_in_subscribe_mode() {
-    let addr = spawn_server().await;
+    let (addr, _pubsub) = spawn_server().await;
     let mut stream = connect(addr).await;
     send(&mut stream, &[b"SUBSCRIBE", b"news"]).await;
     read_reply(&mut stream).await; // ack
@@ -296,19 +308,36 @@ async fn most_commands_are_rejected_while_in_subscribe_mode() {
     );
 }
 
+/// Regression test for a bug found in review: `handle.abort()` only
+/// *requests* cancellation, it doesn't synchronously tear the task (and
+/// the `broadcast::Receiver` it owns) down — checking
+/// `receiver_count() == 0` right after `abort()` with no yield in
+/// between saw the *old* count and never actually removed the channel
+/// from the registry. `PUBLISH` returning `:0` alone doesn't catch
+/// this (a `broadcast::Sender` with zero live receivers already returns
+/// `0` from `send`, whether or not its map entry was ever cleaned up)
+/// — so this test checks `channel_count()` on the registry directly.
 #[tokio::test]
 async fn disconnecting_while_subscribed_cleans_up_so_publish_sees_zero_receivers() {
-    let addr = spawn_server().await;
+    let (addr, pubsub) = spawn_server().await;
 
     let mut subscriber = connect(addr).await;
     send(&mut subscriber, &[b"SUBSCRIBE", b"news"]).await;
     read_reply(&mut subscriber).await; // ack
     settle().await;
+    assert_eq!(pubsub.channel_count(), 1);
+
     drop(subscriber); // simulate a client disconnecting without UNSUBSCRIBE
 
     // Give the server's cleanup (which runs after handle_connection's
     // serve() loop observes the closed socket) a moment to run.
     settle().await;
+
+    assert_eq!(
+        pubsub.channel_count(),
+        0,
+        "expected the channel's broadcast group to be removed from the registry, not just empty of receivers"
+    );
 
     let mut publisher = connect(addr).await;
     send(&mut publisher, &[b"PUBLISH", b"news", b"anybody?"]).await;
