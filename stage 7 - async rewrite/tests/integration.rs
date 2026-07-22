@@ -495,7 +495,10 @@ async fn concurrent_clients_pushing_to_the_same_list_lose_no_pushes() {
     let item_count = (0..pusher_count)
         .filter(|i| reply_str.contains(&format!("item-{i:03}")))
         .count();
-    assert_eq!(item_count, pusher_count, "expected every pushed item to survive");
+    assert_eq!(
+        item_count, pusher_count,
+        "expected every pushed item to survive"
+    );
 }
 
 // ==== stage 7-specific: scale that would be impractical as OS threads ===

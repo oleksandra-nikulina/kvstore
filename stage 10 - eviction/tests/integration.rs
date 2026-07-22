@@ -160,7 +160,10 @@ async fn lru_and_lfu_disagree_over_the_wire_after_a_scan() {
                 "{policy:?}: expected 'hot' to survive, got {reply:?}"
             );
         } else {
-            assert_eq!(reply, b"$-1\r\n", "{policy:?}: expected 'hot' to be evicted");
+            assert_eq!(
+                reply, b"$-1\r\n",
+                "{policy:?}: expected 'hot' to be evicted"
+            );
         }
     }
 }

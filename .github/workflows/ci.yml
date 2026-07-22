@@ -30,7 +30,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
 
       # Deliberately does NOT cache `target/`. It did originally, keyed
       # only on Cargo.lock's hash (which barely ever changes, since
@@ -55,6 +55,10 @@ jobs:
           key: ${{ runner.os }}-cargo-deps-${{ matrix.stage }}-${{ hashFiles(format('{0}/Cargo.lock', matrix.stage)) }}
           restore-keys: |
             ${{ runner.os }}-cargo-deps-${{ matrix.stage }}-
+
+      - name: cargo fmt --check
+        working-directory: ${{ matrix.stage }}
+        run: cargo fmt --check
 
       - name: cargo test
         working-directory: ${{ matrix.stage }}

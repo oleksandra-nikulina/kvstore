@@ -164,7 +164,10 @@ pub fn parse_multibulk(buf: &[u8]) -> Result<ParseResult, ProtocolError> {
         pos = payload_end + 2;
     }
 
-    Ok(ParseResult::Complete { args, consumed: pos })
+    Ok(ParseResult::Complete {
+        args,
+        consumed: pos,
+    })
 }
 
 #[cfg(test)]
@@ -254,10 +257,7 @@ mod tests {
         assert_eq!(Reply::Error("ERR nope".into()).encode(), b"-ERR nope\r\n");
         assert_eq!(Reply::Integer(42).encode(), b":42\r\n");
         assert_eq!(Reply::Bulk(None).encode(), b"$-1\r\n");
-        assert_eq!(
-            Reply::Bulk(Some(b"hi".to_vec())).encode(),
-            b"$2\r\nhi\r\n"
-        );
+        assert_eq!(Reply::Bulk(Some(b"hi".to_vec())).encode(), b"$2\r\nhi\r\n");
         assert_eq!(
             Reply::Array(vec![Reply::Integer(1), Reply::Integer(2)]).encode(),
             b"*2\r\n:1\r\n:2\r\n"

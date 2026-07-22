@@ -61,7 +61,10 @@ pub enum ExpireResult {
 
 impl fmt::Display for WrongType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "WRONGTYPE Operation against a key holding the wrong kind of value")
+        write!(
+            f,
+            "WRONGTYPE Operation against a key holding the wrong kind of value"
+        )
     }
 }
 
@@ -176,8 +179,20 @@ fn lrange_indices(len: usize, start: i64, stop: i64) -> Option<(usize, usize)> {
         return None;
     }
     let len_i = len as i64;
-    let norm_start = |i: i64| if i < 0 { (len_i + i).max(0) } else { i.min(len_i) };
-    let norm_stop = |i: i64| if i < 0 { (len_i + i).max(-1) } else { i.min(len_i - 1) };
+    let norm_start = |i: i64| {
+        if i < 0 {
+            (len_i + i).max(0)
+        } else {
+            i.min(len_i)
+        }
+    };
+    let norm_stop = |i: i64| {
+        if i < 0 {
+            (len_i + i).max(-1)
+        } else {
+            i.min(len_i - 1)
+        }
+    };
     let s = norm_start(start);
     let e = norm_stop(stop);
     if s > e || s >= len_i {
@@ -364,9 +379,7 @@ impl Store {
             None => (ExpireResult::Missing, false),
         };
         drop(data);
-        if expired_away
-            && let Some(limit) = &self.limit
-        {
+        if expired_away && let Some(limit) = &self.limit {
             limit.eviction.forget(key);
         }
         result
@@ -376,7 +389,8 @@ impl Store {
     pub fn ttl(&self, key: &str) -> Option<Option<Duration>> {
         let data = self.data.read().unwrap();
         let now = Instant::now();
-        peek(&data, key, now).map(|entry| entry.expires_at.map(|at| at.saturating_duration_since(now)))
+        peek(&data, key, now)
+            .map(|entry| entry.expires_at.map(|at| at.saturating_duration_since(now)))
     }
 
     pub fn persist(&self, key: &str) -> bool {
@@ -397,9 +411,7 @@ impl Store {
             None => (false, false),
         };
         drop(data);
-        if expired_away
-            && let Some(limit) = &self.limit
-        {
+        if expired_away && let Some(limit) = &self.limit {
             limit.eviction.forget(key);
         }
         result
@@ -588,7 +600,10 @@ impl Store {
         let Value::Hash(hash) = &mut entry.value else {
             return Err(WrongType);
         };
-        let removed = fields.iter().filter(|f| hash.remove(f.as_str()).is_some()).count();
+        let removed = fields
+            .iter()
+            .filter(|f| hash.remove(f.as_str()).is_some())
+            .count();
         let now_empty = hash.is_empty();
         if now_empty {
             data.map.remove(key);
@@ -717,7 +732,10 @@ mod tests {
     fn expire_and_ttl_and_persist_still_work_on_a_string_key() {
         let store = Store::new();
         store.set("k".to_string(), b"v".to_vec());
-        assert_eq!(store.expire("k", Duration::from_secs(60)), ExpireResult::Set);
+        assert_eq!(
+            store.expire("k", Duration::from_secs(60)),
+            ExpireResult::Set
+        );
         assert!(store.ttl("k").unwrap().is_some());
         assert!(store.persist("k"));
         assert_eq!(store.ttl("k"), Some(None));
@@ -762,7 +780,10 @@ mod tests {
     #[test]
     fn lpush_prepends_each_value_reversing_argument_order() {
         let store = Store::new();
-        assert_eq!(store.lpush("l", &[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]), Ok(3));
+        assert_eq!(
+            store.lpush("l", &[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]),
+            Ok(3)
+        );
         assert_eq!(
             store.lrange("l", 0, -1),
             Ok(vec![b"c".to_vec(), b"b".to_vec(), b"a".to_vec()])
@@ -802,7 +823,10 @@ mod tests {
         let store = Store::new();
         store.set("s".to_string(), b"v".to_vec());
         assert_eq!(store.lpush("s", &[b"x".to_vec()]), Err(WrongType));
-        assert_eq!(store.hset("s", "f".to_string(), b"v".to_vec()), Err(WrongType));
+        assert_eq!(
+            store.hset("s", "f".to_string(), b"v".to_vec()),
+            Err(WrongType)
+        );
         assert_eq!(store.sadd("s", &[b"x".to_vec()]), Err(WrongType));
         assert_eq!(store.get("s"), Ok(Some(b"v".to_vec())));
     }
@@ -835,7 +859,11 @@ mod tests {
         // (36-9=27) is enough, so exactly it (not "other") is evicted.
         store.set("new-key".to_string(), vec![0u8; 10]);
 
-        assert_eq!(store.lrange("list-key", 0, -1), Ok(Vec::new()), "list-key should have been evicted");
+        assert_eq!(
+            store.lrange("list-key", 0, -1),
+            Ok(Vec::new()),
+            "list-key should have been evicted"
+        );
         assert_eq!(store.get("other"), Ok(Some(vec![0u8; 5])));
     }
 
@@ -926,7 +954,11 @@ mod tests {
         store.get("k0").unwrap();
         store.set("k3".to_string(), vec![0u8; 10]);
 
-        assert_eq!(store.get("k1"), Ok(None), "k1 should have been evicted, not k0");
+        assert_eq!(
+            store.get("k1"),
+            Ok(None),
+            "k1 should have been evicted, not k0"
+        );
         assert_eq!(store.get("k0"), Ok(Some(vec![0u8; 10])));
     }
 
@@ -971,7 +1003,11 @@ mod tests {
         // Under LRU, "hot" is now the *least* recently used (the scan
         // touched everything else more recently), so it gets evicted
         // despite being read 20 times.
-        assert_eq!(lru.get("hot"), Ok(None), "LRU should have evicted 'hot' after the scan");
+        assert_eq!(
+            lru.get("hot"),
+            Ok(None),
+            "LRU should have evicted 'hot' after the scan"
+        );
 
         let lfu = build(Policy::Lfu);
         lfu.set("new-key".to_string(), vec![0u8; 10]);

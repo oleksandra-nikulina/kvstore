@@ -77,7 +77,9 @@ fn command_from_args(mut args: Vec<Bytes>) -> Command {
                 let mut it = args.into_iter();
                 let key = key_from_bytes(it.next().unwrap());
                 match parse_ttl_arg(&it.next().unwrap()) {
-                    Some(seconds) => Command::Expire(key, Duration::from_secs(seconds.max(0) as u64)),
+                    Some(seconds) => {
+                        Command::Expire(key, Duration::from_secs(seconds.max(0) as u64))
+                    }
                     None => Command::NotAnInteger,
                 }
             }

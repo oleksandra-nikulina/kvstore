@@ -37,9 +37,9 @@ fn a_second_client_is_served_while_the_first_is_still_open() {
         .unwrap();
     second.write_all(b"hi").unwrap();
     let mut buf = [0u8; 2];
-    second
-        .read_exact(&mut buf)
-        .expect("second client should be served promptly even though the first connection is still open");
+    second.read_exact(&mut buf).expect(
+        "second client should be served promptly even though the first connection is still open",
+    );
     assert_eq!(&buf, b"hi");
 }
 

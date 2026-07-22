@@ -23,10 +23,12 @@ async fn main() {
     let aof_path = args.next().unwrap_or_else(|| "kvstore.aof".to_string());
 
     let store = Arc::new(Store::new());
-    let replayed = replay(Path::new(&aof_path), &store).await.unwrap_or_else(|e| {
-        eprintln!("failed to replay AOF {aof_path}: {e}");
-        process::exit(1);
-    });
+    let replayed = replay(Path::new(&aof_path), &store)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("failed to replay AOF {aof_path}: {e}");
+            process::exit(1);
+        });
     println!("AOF: replayed {replayed} command(s) from {aof_path}");
 
     let aof = Arc::new(Aof::open(Path::new(&aof_path)).await.unwrap_or_else(|e| {

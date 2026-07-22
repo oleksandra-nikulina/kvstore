@@ -85,8 +85,16 @@ async fn serve(
                     buf.drain(0..consumed);
                 }
                 Ok(ReadResult::Command { command, consumed }) => {
-                    dispatch(&mut stream, &command, store, aof, pubsub, subscriptions, &push_tx)
-                        .await?;
+                    dispatch(
+                        &mut stream,
+                        &command,
+                        store,
+                        aof,
+                        pubsub,
+                        subscriptions,
+                        &push_tx,
+                    )
+                    .await?;
                     buf.drain(0..consumed);
                 }
                 Err(e) => {
@@ -139,8 +147,10 @@ async fn dispatch(
     push_tx: &mpsc::UnboundedSender<(String, Bytes)>,
 ) -> io::Result<()> {
     let in_subscribe_mode = !subscriptions.is_empty();
-    let allowed_while_subscribed =
-        matches!(command, Command::Subscribe(_) | Command::Unsubscribe(_) | Command::Ping(_));
+    let allowed_while_subscribed = matches!(
+        command,
+        Command::Subscribe(_) | Command::Unsubscribe(_) | Command::Ping(_)
+    );
     if in_subscribe_mode && !allowed_while_subscribed {
         let reply = Reply::Error(
             "ERR only SUBSCRIBE / UNSUBSCRIBE / PING allowed while in pub/sub mode".to_string(),
@@ -188,7 +198,9 @@ async fn dispatch(
         }
         Command::Publish(channel, message) => {
             let count = pubsub.publish(channel, message.clone());
-            stream.write_all(&Reply::Integer(count as i64).encode()).await?;
+            stream
+                .write_all(&Reply::Integer(count as i64).encode())
+                .await?;
         }
         _ => {
             let reply = match aof_args(command) {

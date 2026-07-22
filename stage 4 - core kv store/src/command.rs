@@ -147,14 +147,14 @@ mod tests {
     fn set_then_get_round_trips_through_the_store() {
         let store = Store::new();
         let (set_cmd, _) = read_one(b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n");
-        assert_eq!(
-            set_cmd,
-            Command::Set("foo".to_string(), b"bar".to_vec())
-        );
+        assert_eq!(set_cmd, Command::Set("foo".to_string(), b"bar".to_vec()));
         assert_eq!(execute(&set_cmd, &store), Reply::Simple("OK".into()));
 
         let (get_cmd, _) = read_one(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
-        assert_eq!(execute(&get_cmd, &store), Reply::Bulk(Some(b"bar".to_vec())));
+        assert_eq!(
+            execute(&get_cmd, &store),
+            Reply::Bulk(Some(b"bar".to_vec()))
+        );
     }
 
     #[test]

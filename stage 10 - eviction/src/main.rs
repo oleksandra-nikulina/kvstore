@@ -10,9 +10,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 
 fn usage() -> ! {
-    eprintln!(
-        "usage: kvstore-stage10 [port] [aof_path] [--maxmemory <bytes>] [--policy lru|lfu]"
-    );
+    eprintln!("usage: kvstore-stage10 [port] [aof_path] [--maxmemory <bytes>] [--policy lru|lfu]");
     process::exit(1);
 }
 
@@ -55,10 +53,12 @@ async fn main() {
         None => Store::new(),
     });
 
-    let replayed = replay(Path::new(&aof_path), &store).await.unwrap_or_else(|e| {
-        eprintln!("failed to replay AOF {aof_path}: {e}");
-        process::exit(1);
-    });
+    let replayed = replay(Path::new(&aof_path), &store)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("failed to replay AOF {aof_path}: {e}");
+            process::exit(1);
+        });
     println!("AOF: replayed {replayed} command(s) from {aof_path}");
 
     let aof = Arc::new(Aof::open(Path::new(&aof_path)).await.unwrap_or_else(|e| {
@@ -76,7 +76,9 @@ async fn main() {
         Some(bytes) => println!(
             "stage 10 KV store listening on {addr}, logging to {aof_path}, maxmemory={bytes} bytes, policy={policy:?}"
         ),
-        None => println!("stage 10 KV store listening on {addr}, logging to {aof_path}, no memory limit"),
+        None => println!(
+            "stage 10 KV store listening on {addr}, logging to {aof_path}, no memory limit"
+        ),
     }
 
     if let Err(e) = run(listener, store, aof, pubsub).await {

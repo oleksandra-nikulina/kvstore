@@ -126,10 +126,7 @@ async fn a_single_subscriber_receives_a_published_message() {
     let mut subscriber = connect(addr).await;
     send(&mut subscriber, &[b"SUBSCRIBE", b"news"]).await;
     let ack = read_reply(&mut subscriber).await;
-    assert_eq!(
-        ack,
-        b"*3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:1\r\n"
-    );
+    assert_eq!(ack, b"*3\r\n$9\r\nsubscribe\r\n$4\r\nnews\r\n:1\r\n");
 
     settle().await;
 
@@ -174,7 +171,10 @@ async fn many_concurrent_subscribers_all_receive_the_same_published_message() {
     let mut publisher = connect(addr).await;
     send(&mut publisher, &[b"PUBLISH", b"broadcast", b"to everyone"]).await;
     let receiver_count = read_reply(&mut publisher).await;
-    assert_eq!(receiver_count, format!(":{subscriber_count}\r\n").into_bytes());
+    assert_eq!(
+        receiver_count,
+        format!(":{subscriber_count}\r\n").into_bytes()
+    );
 
     for mut stream in subscribers {
         let pushed = read_reply(&mut stream).await;
@@ -214,8 +214,12 @@ async fn a_connection_can_subscribe_to_multiple_channels_and_gets_both() {
     for _ in 0..2 {
         received.insert(read_reply(&mut subscriber).await);
     }
-    assert!(received.contains(b"*3\r\n$7\r\nmessage\r\n$6\r\nsports\r\n$5\r\nscore\r\n".as_slice()));
-    assert!(received.contains(b"*3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$8\r\nheadline\r\n".as_slice()));
+    assert!(
+        received.contains(b"*3\r\n$7\r\nmessage\r\n$6\r\nsports\r\n$5\r\nscore\r\n".as_slice())
+    );
+    assert!(
+        received.contains(b"*3\r\n$7\r\nmessage\r\n$4\r\nnews\r\n$8\r\nheadline\r\n".as_slice())
+    );
 }
 
 #[tokio::test]

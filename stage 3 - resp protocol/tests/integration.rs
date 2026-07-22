@@ -62,7 +62,10 @@ fn unknown_command_gets_an_error_reply_but_the_connection_stays_open() {
     let mut buf = [0u8; 1024];
     let n = stream.read(&mut buf).unwrap();
     let reply = String::from_utf8_lossy(&buf[..n]);
-    assert!(reply.starts_with('-'), "expected an error reply, got {reply:?}");
+    assert!(
+        reply.starts_with('-'),
+        "expected an error reply, got {reply:?}"
+    );
     assert!(reply.contains("unknown command"));
 
     // Framing was still valid RESP, so the connection is still usable.

@@ -80,7 +80,9 @@ fn command_from_args(mut args: Vec<Bytes>) -> Command {
                 let mut it = args.into_iter();
                 let key = key_from_bytes(it.next().unwrap());
                 match parse_i64(&it.next().unwrap()) {
-                    Some(seconds) => Command::Expire(key, Duration::from_secs(seconds.max(0) as u64)),
+                    Some(seconds) => {
+                        Command::Expire(key, Duration::from_secs(seconds.max(0) as u64))
+                    }
                     None => Command::NotAnInteger,
                 }
             }
@@ -91,7 +93,9 @@ fn command_from_args(mut args: Vec<Bytes>) -> Command {
                 let mut it = args.into_iter();
                 let key = key_from_bytes(it.next().unwrap());
                 match parse_i64(&it.next().unwrap()) {
-                    Some(millis) => Command::Pexpire(key, Duration::from_millis(millis.max(0) as u64)),
+                    Some(millis) => {
+                        Command::Pexpire(key, Duration::from_millis(millis.max(0) as u64))
+                    }
                     None => Command::NotAnInteger,
                 }
             }
@@ -290,12 +294,10 @@ pub fn execute(command: &Command, store: &Store) -> Reply {
             Ok(value) => Reply::Bulk(value),
             Err(_) => wrongtype(),
         },
-        Command::Hset(key, field, value) => {
-            match store.hset(key, field.clone(), value.clone()) {
-                Ok(is_new) => Reply::Integer(if is_new { 1 } else { 0 }),
-                Err(_) => wrongtype(),
-            }
-        }
+        Command::Hset(key, field, value) => match store.hset(key, field.clone(), value.clone()) {
+            Ok(is_new) => Reply::Integer(if is_new { 1 } else { 0 }),
+            Err(_) => wrongtype(),
+        },
         Command::Hget(key, field) => match store.hget(key, field) {
             Ok(value) => Reply::Bulk(value),
             Err(_) => wrongtype(),
@@ -563,7 +565,10 @@ mod tests {
             Some(vec![b"EXPIRE".to_vec(), b"k".to_vec(), b"60".to_vec()])
         );
         assert_eq!(
-            aof_args(&Command::Pexpire("k".to_string(), Duration::from_millis(500))),
+            aof_args(&Command::Pexpire(
+                "k".to_string(),
+                Duration::from_millis(500)
+            )),
             Some(vec![b"PEXPIRE".to_vec(), b"k".to_vec(), b"500".to_vec()])
         );
         assert_eq!(
@@ -571,8 +576,16 @@ mod tests {
             Some(vec![b"PERSIST".to_vec(), b"k".to_vec()])
         );
         assert_eq!(
-            aof_args(&Command::Lpush("l".to_string(), vec![b"a".to_vec(), b"b".to_vec()])),
-            Some(vec![b"LPUSH".to_vec(), b"l".to_vec(), b"a".to_vec(), b"b".to_vec()])
+            aof_args(&Command::Lpush(
+                "l".to_string(),
+                vec![b"a".to_vec(), b"b".to_vec()]
+            )),
+            Some(vec![
+                b"LPUSH".to_vec(),
+                b"l".to_vec(),
+                b"a".to_vec(),
+                b"b".to_vec()
+            ])
         );
         assert_eq!(
             aof_args(&Command::Rpush("l".to_string(), vec![b"a".to_vec()])),
@@ -583,8 +596,17 @@ mod tests {
             Some(vec![b"LPOP".to_vec(), b"l".to_vec()])
         );
         assert_eq!(
-            aof_args(&Command::Hset("h".to_string(), "f".to_string(), b"v".to_vec())),
-            Some(vec![b"HSET".to_vec(), b"h".to_vec(), b"f".to_vec(), b"v".to_vec()])
+            aof_args(&Command::Hset(
+                "h".to_string(),
+                "f".to_string(),
+                b"v".to_vec()
+            )),
+            Some(vec![
+                b"HSET".to_vec(),
+                b"h".to_vec(),
+                b"f".to_vec(),
+                b"v".to_vec()
+            ])
         );
         assert_eq!(
             aof_args(&Command::Hdel("h".to_string(), vec!["f".to_string()])),
@@ -607,10 +629,16 @@ mod tests {
         assert_eq!(aof_args(&Command::Get("k".to_string())), None);
         assert_eq!(aof_args(&Command::Ttl("k".to_string())), None);
         assert_eq!(aof_args(&Command::Lrange("l".to_string(), 0, -1)), None);
-        assert_eq!(aof_args(&Command::Hget("h".to_string(), "f".to_string())), None);
+        assert_eq!(
+            aof_args(&Command::Hget("h".to_string(), "f".to_string())),
+            None
+        );
         assert_eq!(aof_args(&Command::Hgetall("h".to_string())), None);
         assert_eq!(aof_args(&Command::Smembers("s".to_string())), None);
-        assert_eq!(aof_args(&Command::Sismember("s".to_string(), b"m".to_vec())), None);
+        assert_eq!(
+            aof_args(&Command::Sismember("s".to_string(), b"m".to_vec())),
+            None
+        );
         assert_eq!(aof_args(&Command::Unknown(b"FOO".to_vec())), None);
         assert_eq!(aof_args(&Command::WrongArity(b"GET".to_vec())), None);
         assert_eq!(aof_args(&Command::NotAnInteger), None);

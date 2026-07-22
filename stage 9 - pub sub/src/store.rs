@@ -65,7 +65,10 @@ pub enum ExpireResult {
 
 impl fmt::Display for WrongType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "WRONGTYPE Operation against a key holding the wrong kind of value")
+        write!(
+            f,
+            "WRONGTYPE Operation against a key holding the wrong kind of value"
+        )
     }
 }
 
@@ -90,7 +93,11 @@ fn peek<'a>(data: &'a HashMap<String, Entry>, key: &str, now: Instant) -> Option
 /// holds an exclusive write guard for its own reasons (it's about to
 /// mutate regardless), so doing the cleanup here costs nothing extra,
 /// unlike on the read path (see [`peek`]).
-fn touch<'a>(data: &'a mut HashMap<String, Entry>, key: &str, now: Instant) -> Option<&'a mut Entry> {
+fn touch<'a>(
+    data: &'a mut HashMap<String, Entry>,
+    key: &str,
+    now: Instant,
+) -> Option<&'a mut Entry> {
     match data.get(key) {
         Some(entry) if entry.is_expired(now) => {
             data.remove(key);
@@ -133,8 +140,20 @@ fn lrange_indices(len: usize, start: i64, stop: i64) -> Option<(usize, usize)> {
         return None;
     }
     let len_i = len as i64;
-    let norm_start = |i: i64| if i < 0 { (len_i + i).max(0) } else { i.min(len_i) };
-    let norm_stop = |i: i64| if i < 0 { (len_i + i).max(-1) } else { i.min(len_i - 1) };
+    let norm_start = |i: i64| {
+        if i < 0 {
+            (len_i + i).max(0)
+        } else {
+            i.min(len_i)
+        }
+    };
+    let norm_stop = |i: i64| {
+        if i < 0 {
+            (len_i + i).max(-1)
+        } else {
+            i.min(len_i - 1)
+        }
+    };
     let s = norm_start(start);
     let e = norm_stop(stop);
     if s > e || s >= len_i {
@@ -222,7 +241,8 @@ impl Store {
     pub fn ttl(&self, key: &str) -> Option<Option<Duration>> {
         let data = self.data.read().unwrap();
         let now = Instant::now();
-        peek(&data, key, now).map(|entry| entry.expires_at.map(|at| at.saturating_duration_since(now)))
+        peek(&data, key, now)
+            .map(|entry| entry.expires_at.map(|at| at.saturating_duration_since(now)))
     }
 
     pub fn persist(&self, key: &str) -> bool {
@@ -370,7 +390,10 @@ impl Store {
         let Value::Hash(hash) = &mut entry.value else {
             return Err(WrongType);
         };
-        let removed = fields.iter().filter(|f| hash.remove(f.as_str()).is_some()).count();
+        let removed = fields
+            .iter()
+            .filter(|f| hash.remove(f.as_str()).is_some())
+            .count();
         let now_empty = hash.is_empty();
         if now_empty {
             data.remove(key);
@@ -467,7 +490,10 @@ mod tests {
     fn expire_and_ttl_and_persist_still_work_on_a_string_key() {
         let store = Store::new();
         store.set("k".to_string(), b"v".to_vec());
-        assert_eq!(store.expire("k", Duration::from_secs(60)), ExpireResult::Set);
+        assert_eq!(
+            store.expire("k", Duration::from_secs(60)),
+            ExpireResult::Set
+        );
         assert!(store.ttl("k").unwrap().is_some());
         assert!(store.persist("k"));
         assert_eq!(store.ttl("k"), Some(None));
@@ -535,7 +561,11 @@ mod tests {
 
         assert_eq!(store.get("k"), Ok(None));
         assert_eq!(store.ttl("k"), None);
-        assert_eq!(store.len(), 1, "the expired entry should still physically occupy its map slot");
+        assert_eq!(
+            store.len(),
+            1,
+            "the expired entry should still physically occupy its map slot"
+        );
 
         store.sweep_expired();
         assert_eq!(store.len(), 0);
@@ -546,7 +576,10 @@ mod tests {
     #[test]
     fn lpush_prepends_each_value_reversing_argument_order() {
         let store = Store::new();
-        assert_eq!(store.lpush("l", &[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]), Ok(3));
+        assert_eq!(
+            store.lpush("l", &[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]),
+            Ok(3)
+        );
         assert_eq!(
             store.lrange("l", 0, -1),
             Ok(vec![b"c".to_vec(), b"b".to_vec(), b"a".to_vec()])
@@ -556,7 +589,10 @@ mod tests {
     #[test]
     fn rpush_appends_each_value_preserving_argument_order() {
         let store = Store::new();
-        assert_eq!(store.rpush("l", &[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]), Ok(3));
+        assert_eq!(
+            store.rpush("l", &[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]),
+            Ok(3)
+        );
         assert_eq!(
             store.lrange("l", 0, -1),
             Ok(vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
@@ -572,9 +608,14 @@ mod tests {
     #[test]
     fn lrange_handles_negative_and_out_of_bounds_indices() {
         let store = Store::new();
-        store.rpush("l", &[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]).unwrap();
+        store
+            .rpush("l", &[b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
+            .unwrap();
 
-        assert_eq!(store.lrange("l", -2, -1), Ok(vec![b"b".to_vec(), b"c".to_vec()]));
+        assert_eq!(
+            store.lrange("l", -2, -1),
+            Ok(vec![b"b".to_vec(), b"c".to_vec()])
+        );
         assert_eq!(
             store.lrange("l", 0, 100),
             Ok(vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()])
@@ -628,7 +669,13 @@ mod tests {
 
         let mut pairs = store.hgetall("h").unwrap();
         pairs.sort();
-        assert_eq!(pairs, vec![("a".to_string(), b"1".to_vec()), ("b".to_string(), b"2".to_vec())]);
+        assert_eq!(
+            pairs,
+            vec![
+                ("a".to_string(), b"1".to_vec()),
+                ("b".to_string(), b"2".to_vec())
+            ]
+        );
     }
 
     #[test]
@@ -637,7 +684,10 @@ mod tests {
         store.hset("h", "a".to_string(), b"1".to_vec()).unwrap();
         store.hset("h", "b".to_string(), b"2".to_vec()).unwrap();
 
-        assert_eq!(store.hdel("h", &["a".to_string(), "missing".to_string()]), Ok(1));
+        assert_eq!(
+            store.hdel("h", &["a".to_string(), "missing".to_string()]),
+            Ok(1)
+        );
         assert_eq!(store.hdel("h", &["b".to_string()]), Ok(1));
         assert_eq!(store.len(), 0, "an emptied hash should not linger as a key");
     }
@@ -646,7 +696,10 @@ mod tests {
     fn hash_ops_against_a_string_key_are_wrongtype() {
         let store = Store::new();
         store.set("s".to_string(), b"v".to_vec());
-        assert_eq!(store.hset("s", "f".to_string(), b"v".to_vec()), Err(WrongType));
+        assert_eq!(
+            store.hset("s", "f".to_string(), b"v".to_vec()),
+            Err(WrongType)
+        );
         assert_eq!(store.hget("s", "f"), Err(WrongType));
         assert_eq!(store.hgetall("s"), Err(WrongType));
         assert_eq!(store.hdel("s", &["f".to_string()]), Err(WrongType));
@@ -679,7 +732,10 @@ mod tests {
         let store = Store::new();
         store.sadd("s", &[b"a".to_vec(), b"b".to_vec()]).unwrap();
 
-        assert_eq!(store.srem("s", &[b"a".to_vec(), b"missing".to_vec()]), Ok(1));
+        assert_eq!(
+            store.srem("s", &[b"a".to_vec(), b"missing".to_vec()]),
+            Ok(1)
+        );
         assert_eq!(store.srem("s", &[b"b".to_vec()]), Ok(1));
         assert_eq!(store.len(), 0, "an emptied set should not linger as a key");
     }

@@ -67,7 +67,9 @@ fn a_second_client_waits_behind_a_still_open_first_connection() {
     // Now that the first connection is gone, the server accepts the
     // second one and echoes back the "hi" that was already waiting in
     // its receive buffer.
-    second.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    second
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
     let mut buf = [0u8; 2];
     second.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, b"hi");

@@ -25,7 +25,7 @@ stages=(
 failures=()
 for stage in "${stages[@]}"; do
   echo "=== $stage ==="
-  if (cd "$stage" && cargo test --all-targets -q && cargo clippy --all-targets -q -- -D warnings); then
+  if (cd "$stage" && cargo fmt --check -q && cargo test --all-targets -q && cargo clippy --all-targets -q -- -D warnings); then
     echo "--- ok ---"
   else
     echo "--- FAILED ---"

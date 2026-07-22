@@ -123,7 +123,11 @@ fn hset_hget_hdel_over_the_wire() {
     send(&mut stream, &[b"HSET", b"h", b"f1", b"v1"]);
     assert_eq!(read_reply(&mut stream), b":1\r\n");
     send(&mut stream, &[b"HSET", b"h", b"f1", b"v2"]);
-    assert_eq!(read_reply(&mut stream), b":0\r\n", "overwriting an existing field isn't 'new'");
+    assert_eq!(
+        read_reply(&mut stream),
+        b":0\r\n",
+        "overwriting an existing field isn't 'new'"
+    );
 
     send(&mut stream, &[b"HGET", b"h", b"f1"]);
     assert_eq!(read_reply(&mut stream), bulk(b"v2"));
@@ -142,7 +146,11 @@ fn sadd_sismember_srem_over_the_wire() {
     let mut stream = connect(spawn_server());
 
     send(&mut stream, &[b"SADD", b"s", b"a", b"b", b"a"]);
-    assert_eq!(read_reply(&mut stream), b":2\r\n", "duplicate member shouldn't count twice");
+    assert_eq!(
+        read_reply(&mut stream),
+        b":2\r\n",
+        "duplicate member shouldn't count twice"
+    );
 
     send(&mut stream, &[b"SISMEMBER", b"s", b"a"]);
     assert_eq!(read_reply(&mut stream), b":1\r\n");
@@ -195,7 +203,10 @@ fn concurrent_clients_pushing_to_the_same_list_lose_no_pushes() {
                 let value = format!("item-{i:03}");
                 send(&mut stream, &[b"RPUSH", b"shared-list", value.as_bytes()]);
                 let reply = read_reply(&mut stream);
-                assert!(reply.starts_with(b":"), "expected an integer reply, got {reply:?}");
+                assert!(
+                    reply.starts_with(b":"),
+                    "expected an integer reply, got {reply:?}"
+                );
             })
         })
         .collect();
@@ -210,5 +221,8 @@ fn concurrent_clients_pushing_to_the_same_list_lose_no_pushes() {
     let item_count = (0..pusher_count)
         .filter(|i| reply_str.contains(&format!("item-{i:03}")))
         .count();
-    assert_eq!(item_count, pusher_count, "expected every pushed item to survive");
+    assert_eq!(
+        item_count, pusher_count,
+        "expected every pushed item to survive"
+    );
 }

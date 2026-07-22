@@ -146,7 +146,8 @@ impl Store {
     pub fn ttl(&self, key: &str) -> Option<Option<Duration>> {
         let data = self.data.read().unwrap();
         let now = Instant::now();
-        peek(&data, key, now).map(|entry| entry.expires_at.map(|at| at.saturating_duration_since(now)))
+        peek(&data, key, now)
+            .map(|entry| entry.expires_at.map(|at| at.saturating_duration_since(now)))
     }
 
     /// Clears `key`'s TTL, if it has one. Returns whether a TTL was
@@ -293,7 +294,10 @@ mod tests {
         let store = Store::new();
         store.set("k".to_string(), b"v".to_vec());
 
-        assert_eq!(store.expire("k", Duration::from_secs(60)), ExpireResult::Set);
+        assert_eq!(
+            store.expire("k", Duration::from_secs(60)),
+            ExpireResult::Set
+        );
 
         let remaining = store.ttl("k").unwrap().unwrap();
         assert!(remaining <= Duration::from_secs(60));
@@ -428,9 +432,17 @@ mod tests {
         assert_eq!(store.get("k"), None);
         assert_eq!(store.get("k"), None);
         assert_eq!(store.ttl("k"), None);
-        assert_eq!(store.len(), 1, "the expired entry should still physically occupy its map slot");
+        assert_eq!(
+            store.len(),
+            1,
+            "the expired entry should still physically occupy its map slot"
+        );
 
         store.sweep_expired();
-        assert_eq!(store.len(), 0, "the sweep should be what actually removes it");
+        assert_eq!(
+            store.len(),
+            0,
+            "the sweep should be what actually removes it"
+        );
     }
 }

@@ -80,7 +80,9 @@ fn command_from_args(mut args: Vec<Bytes>) -> Command {
                 let mut it = args.into_iter();
                 let key = key_from_bytes(it.next().unwrap());
                 match parse_i64(&it.next().unwrap()) {
-                    Some(seconds) => Command::Expire(key, Duration::from_secs(seconds.max(0) as u64)),
+                    Some(seconds) => {
+                        Command::Expire(key, Duration::from_secs(seconds.max(0) as u64))
+                    }
                     None => Command::NotAnInteger,
                 }
             }
@@ -91,7 +93,9 @@ fn command_from_args(mut args: Vec<Bytes>) -> Command {
                 let mut it = args.into_iter();
                 let key = key_from_bytes(it.next().unwrap());
                 match parse_i64(&it.next().unwrap()) {
-                    Some(millis) => Command::Pexpire(key, Duration::from_millis(millis.max(0) as u64)),
+                    Some(millis) => {
+                        Command::Pexpire(key, Duration::from_millis(millis.max(0) as u64))
+                    }
                     None => Command::NotAnInteger,
                 }
             }
@@ -290,12 +294,10 @@ pub fn execute(command: &Command, store: &Store) -> Reply {
             Ok(value) => Reply::Bulk(value),
             Err(_) => wrongtype(),
         },
-        Command::Hset(key, field, value) => {
-            match store.hset(key, field.clone(), value.clone()) {
-                Ok(is_new) => Reply::Integer(if is_new { 1 } else { 0 }),
-                Err(_) => wrongtype(),
-            }
-        }
+        Command::Hset(key, field, value) => match store.hset(key, field.clone(), value.clone()) {
+            Ok(is_new) => Reply::Integer(if is_new { 1 } else { 0 }),
+            Err(_) => wrongtype(),
+        },
         Command::Hget(key, field) => match store.hget(key, field) {
             Ok(value) => Reply::Bulk(value),
             Err(_) => wrongtype(),

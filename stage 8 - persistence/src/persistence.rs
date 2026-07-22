@@ -249,7 +249,10 @@ mod tests {
         let restarted = Store::new();
         let replayed = replay(&path, &restarted).await.unwrap();
 
-        assert_eq!(replayed, 1, "only the complete entry before the truncation should replay");
+        assert_eq!(
+            replayed, 1,
+            "only the complete entry before the truncation should replay"
+        );
         assert_eq!(restarted.get("safe"), Ok(Some(b"value".to_vec())));
         assert_eq!(restarted.get("gone"), Ok(None));
 
@@ -271,13 +274,18 @@ mod tests {
         {
             use tokio::io::AsyncWriteExt as _;
             let mut file = OpenOptions::new().append(true).open(&path).await.unwrap();
-            file.write_all(b"this is not RESP at all\r\n").await.unwrap();
+            file.write_all(b"this is not RESP at all\r\n")
+                .await
+                .unwrap();
         }
 
         let restarted = Store::new();
         let replayed = replay(&path, &restarted).await.unwrap();
 
-        assert_eq!(replayed, 1, "everything before the corrupt entry should still replay");
+        assert_eq!(
+            replayed, 1,
+            "everything before the corrupt entry should still replay"
+        );
         assert_eq!(restarted.get("safe"), Ok(Some(b"value".to_vec())));
 
         let _ = std::fs::remove_file(&path);

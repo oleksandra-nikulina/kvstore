@@ -45,7 +45,9 @@ impl Store {
     /// actually existed (matches `DEL`'s reply semantics).
     pub fn del(&self, keys: &[String]) -> usize {
         let mut data = self.data.write().unwrap();
-        keys.iter().filter(|k| data.remove(k.as_str()).is_some()).count()
+        keys.iter()
+            .filter(|k| data.remove(k.as_str()).is_some())
+            .count()
     }
 
     #[cfg(test)]

@@ -38,7 +38,9 @@ fn encode_command(parts: &[&[u8]]) -> Vec<u8> {
 #[test]
 fn get_on_a_missing_key_replies_a_null_bulk_string() {
     let mut stream = connect(spawn_server());
-    stream.write_all(&encode_command(&[b"GET", b"nope"])).unwrap();
+    stream
+        .write_all(&encode_command(&[b"GET", b"nope"]))
+        .unwrap();
     assert_eq!(read_n(&mut stream, 5), b"$-1\r\n");
 }
 
@@ -51,7 +53,9 @@ fn set_then_get_round_trips_over_the_wire() {
         .unwrap();
     assert_eq!(read_n(&mut stream, 5), b"+OK\r\n");
 
-    stream.write_all(&encode_command(&[b"GET", b"foo"])).unwrap();
+    stream
+        .write_all(&encode_command(&[b"GET", b"foo"]))
+        .unwrap();
     assert_eq!(read_n(&mut stream, 9), b"$3\r\nbar\r\n");
 }
 
@@ -88,7 +92,11 @@ fn a_value_persists_across_separate_connections() {
     reader
         .write_all(&encode_command(&[b"GET", b"shared-key"]))
         .unwrap();
-    let expected = format!("${}\r\n{}\r\n", value.len(), std::str::from_utf8(value).unwrap());
+    let expected = format!(
+        "${}\r\n{}\r\n",
+        value.len(),
+        std::str::from_utf8(value).unwrap()
+    );
     assert_eq!(read_n(&mut reader, expected.len()), expected.as_bytes());
 }
 
@@ -154,7 +162,9 @@ fn concurrent_clients_racing_on_a_shared_key_never_produce_a_torn_value() {
     }
 
     let mut reader = connect(addr);
-    reader.write_all(&encode_command(&[b"GET", b"shared"])).unwrap();
+    reader
+        .write_all(&encode_command(&[b"GET", b"shared"]))
+        .unwrap();
     let header = read_n(&mut reader, 5); // "$64\r\n"
     assert_eq!(&header, b"$64\r\n");
     let value = read_n(&mut reader, 64);

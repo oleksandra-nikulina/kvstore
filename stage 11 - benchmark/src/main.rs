@@ -36,7 +36,9 @@ impl std::str::FromStr for CommandMode {
             "both" => Ok(CommandMode::Both),
             "get" => Ok(CommandMode::GetOnly),
             "set" => Ok(CommandMode::SetOnly),
-            other => Err(format!("unknown command mode '{other}' (expected both, get, or set)")),
+            other => Err(format!(
+                "unknown command mode '{other}' (expected both, get, or set)"
+            )),
         }
     }
 }
@@ -95,11 +97,17 @@ impl Config {
             match arg.as_str() {
                 "--port" => port = Some(next_arg(&mut args).parse().unwrap_or_else(|_| usage())),
                 "--clients" => clients = next_arg(&mut args).parse().unwrap_or_else(|_| usage()),
-                "--warmup-secs" => warmup_secs = next_arg(&mut args).parse().unwrap_or_else(|_| usage()),
-                "--duration-secs" => duration_secs = next_arg(&mut args).parse().unwrap_or_else(|_| usage()),
+                "--warmup-secs" => {
+                    warmup_secs = next_arg(&mut args).parse().unwrap_or_else(|_| usage())
+                }
+                "--duration-secs" => {
+                    duration_secs = next_arg(&mut args).parse().unwrap_or_else(|_| usage())
+                }
                 "--workload" => workload = next_arg(&mut args).parse().unwrap_or_else(|_| usage()),
                 "--command" => command = next_arg(&mut args).parse().unwrap_or_else(|_| usage()),
-                "--payload-size" => payload_size = next_arg(&mut args).parse().unwrap_or_else(|_| usage()),
+                "--payload-size" => {
+                    payload_size = next_arg(&mut args).parse().unwrap_or_else(|_| usage())
+                }
                 "--pipeline" => pipeline = next_arg(&mut args).parse().unwrap_or_else(|_| usage()),
                 "--label" => label = next_arg(&mut args),
                 "--csv" => csv = true,
@@ -135,7 +143,12 @@ impl Config {
 /// doing something real if you're watching. `SpreadKeys` skips this —
 /// pre-filling a million keys isn't worth the setup time it'd cost
 /// every single run.
-async fn prefill(stream: &mut TcpStream, workload: Workload, client_id: usize, payload: &[u8]) -> io::Result<()> {
+async fn prefill(
+    stream: &mut TcpStream,
+    workload: Workload,
+    client_id: usize,
+    payload: &[u8],
+) -> io::Result<()> {
     match workload {
         Workload::SetGet => {
             let key = format!("bench-client-{client_id}");
@@ -192,8 +205,20 @@ struct RunParams {
 /// `barrier.wait()` — a barrier can only release once *every*
 /// registered participant has called `wait()`, and a client that
 /// panics before doing so can never satisfy that count.
-async fn run_client(id: usize, addr: SocketAddr, params: RunParams, barrier: Arc<Barrier>) -> (bool, Vec<Duration>) {
-    let RunParams { workload, payload_size, pipeline, command, warmup, duration } = params;
+async fn run_client(
+    id: usize,
+    addr: SocketAddr,
+    params: RunParams,
+    barrier: Arc<Barrier>,
+) -> (bool, Vec<Duration>) {
+    let RunParams {
+        workload,
+        payload_size,
+        pipeline,
+        command,
+        warmup,
+        duration,
+    } = params;
 
     let mut stream = match TcpStream::connect(addr).await {
         Ok(s) => s,
@@ -298,7 +323,9 @@ async fn run_client(id: usize, addr: SocketAddr, params: RunParams, barrier: Arc
             if elapsed >= total {
                 break;
             }
-            let keys: Vec<String> = (0..pipeline).map(|_| workload.key_for(id, &mut rng)).collect();
+            let keys: Vec<String> = (0..pipeline)
+                .map(|_| workload.key_for(id, &mut rng))
+                .collect();
 
             let batch_start = Instant::now();
             let mut send_error = None;
@@ -414,7 +441,9 @@ async fn main() {
                 }
             }
             Err(e) => {
-                eprintln!("a client task panicked (unexpected, not a connection/protocol failure): {e}");
+                eprintln!(
+                    "a client task panicked (unexpected, not a connection/protocol failure): {e}"
+                );
                 failed_clients += 1;
             }
         }
