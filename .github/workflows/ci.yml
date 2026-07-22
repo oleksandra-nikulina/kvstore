@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: ${{ matrix.stage }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        stage:
+          - "stage 1 - tcp echo server"
+          - "stage 2 - thread per connection"
+          - "stage 3 - resp protocol"
+          - "stage 4 - core kv store"
+          - "stage 5 - expiration"
+          - "stage 6 - data types"
+          - "stage 7 - async rewrite"
+          - "stage 8 - persistence"
+          - "stage 9 - pub sub"
+          - "stage 10 - eviction"
+          - "stage 11 - benchmark"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ${{ matrix.stage }}/target
+          key: ${{ runner.os }}-cargo-${{ matrix.stage }}-${{ hashFiles(format('{0}/Cargo.lock', matrix.stage)) }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.stage }}-
+
+      - name: cargo test
+        working-directory: ${{ matrix.stage }}
+        run: cargo test --all-targets
+
+      - name: cargo clippy
+        working-directory: ${{ matrix.stage }}
+        run: cargo clippy --all-targets -- -D warnings
