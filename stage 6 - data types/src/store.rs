@@ -6,10 +6,24 @@
 //! [`Value`] variant matches what the command expects — mismatched
 //! (`LPUSH` on a key holding a plain string, say) is a [`WrongType`]
 //! error, exactly like real Redis's `WRONGTYPE`.
+//!
+//! A single `RwLock`, not a `Mutex`: every genuinely read-only method
+//! (`get`, `ttl`, `lrange`, `hget`, `hgetall`, `smembers`, `sismember`)
+//! takes a shared read lock via [`peek`] and can run concurrently with
+//! other reads; every method that mutates (`set`, `del`,
+//! `lpush`/`rpush`/`lpop`, `hset`/`hdel`, `sadd`/`srem`, `expire`,
+//! `persist`, `sweep_expired`) still needs exclusive access via
+//! [`touch`]/[`vivify`], same as before. See `DESIGN_TRADEOFFS_NOTES.md`
+//! at the project root for the full reasoning on why this is a real but
+//! bounded improvement, not a free lunch: `RwLock` isn't "cheaper" than
+//! `Mutex` per call, `std::sync::RwLock` makes no fairness guarantee
+//! (a writer could in principle be starved by steady read traffic), and
+//! it does nothing for the deeper one-lock-over-the-whole-keyspace
+//! ceiling — that needs sharding, out of scope here.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 pub type Bytes = Vec<u8>;
@@ -55,10 +69,27 @@ impl fmt::Display for WrongType {
     }
 }
 
-/// Looks up `key`, treating an already-expired entry as absent (and
-/// removing it on the spot) exactly like every other lazy-expiry check
-/// in this store. Shared by every typed operation below so each one
-/// doesn't have to repeat the expiry dance.
+/// Read-only lookup: treats an expired entry as absent **without
+/// removing it**. This is what lets every genuinely read-only method
+/// below take a shared `RwLock::read()` guard (`&HashMap`, not `&mut`)
+/// instead of an exclusive write guard — a real non-mutating read path,
+/// not just a relabeled write path. The trade-off: an expired key
+/// nobody ever writes through again now only gets physically removed by
+/// the active sweep (or a `touch`/`vivify`-based write-path operation
+/// that happens to land on it), not by the read that first observes it
+/// as gone. Observably identical to a client either way.
+fn peek<'a>(data: &'a HashMap<String, Entry>, key: &str, now: Instant) -> Option<&'a Entry> {
+    match data.get(key) {
+        Some(entry) if !entry.is_expired(now) => Some(entry),
+        _ => None,
+    }
+}
+
+/// Looks up `key` on the *write* path, treating an already-expired entry
+/// as absent and removing it on the spot — every caller here already
+/// holds an exclusive write guard for its own reasons (it's about to
+/// mutate regardless), so doing the cleanup here costs nothing extra,
+/// unlike on the read path (see [`peek`]).
 fn touch<'a>(data: &'a mut HashMap<String, Entry>, key: &str, now: Instant) -> Option<&'a mut Entry> {
     match data.get(key) {
         Some(entry) if entry.is_expired(now) => {
@@ -114,22 +145,21 @@ fn lrange_indices(len: usize, start: i64, stop: i64) -> Option<(usize, usize)> {
 }
 
 pub struct Store {
-    data: Mutex<HashMap<String, Entry>>,
+    data: RwLock<HashMap<String, Entry>>,
 }
 
 impl Store {
     pub fn new() -> Self {
         Store {
-            data: Mutex::new(HashMap::new()),
+            data: RwLock::new(HashMap::new()),
         }
     }
 
     // ---- plain bytes ----------------------------------------------
 
     pub fn get(&self, key: &str) -> Result<Option<Bytes>, WrongType> {
-        let mut data = self.data.lock().unwrap();
-        let now = Instant::now();
-        let Some(entry) = touch(&mut data, key, now) else {
+        let data = self.data.read().unwrap();
+        let Some(entry) = peek(&data, key, Instant::now()) else {
             return Ok(None);
         };
         match &entry.value {
@@ -142,7 +172,7 @@ impl Store {
     /// as real Redis, plain `SET` always succeeds and always leaves the
     /// key holding a string, clearing any TTL it had.
     pub fn set(&self, key: String, value: Bytes) {
-        self.data.lock().unwrap().insert(
+        self.data.write().unwrap().insert(
             key,
             Entry {
                 value: Value::Bytes(value),
@@ -152,7 +182,7 @@ impl Store {
     }
 
     pub fn del(&self, keys: &[String]) -> usize {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.write().unwrap();
         let now = Instant::now();
         let mut removed = 0;
         for key in keys {
@@ -170,7 +200,7 @@ impl Store {
     /// `checked_add` and reports that case explicitly instead of taking
     /// down the connection thread.
     pub fn expire(&self, key: &str, ttl: Duration) -> ExpireResult {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.write().unwrap();
         let now = Instant::now();
         match data.get_mut(key) {
             Some(entry) if !entry.is_expired(now) => match now.checked_add(ttl) {
@@ -188,21 +218,15 @@ impl Store {
         }
     }
 
+    /// Pure read path — see [`peek`].
     pub fn ttl(&self, key: &str) -> Option<Option<Duration>> {
-        let mut data = self.data.lock().unwrap();
+        let data = self.data.read().unwrap();
         let now = Instant::now();
-        match data.get(key) {
-            Some(entry) if entry.is_expired(now) => {
-                data.remove(key);
-                None
-            }
-            Some(entry) => Some(entry.expires_at.map(|at| at.saturating_duration_since(now))),
-            None => None,
-        }
+        peek(&data, key, now).map(|entry| entry.expires_at.map(|at| at.saturating_duration_since(now)))
     }
 
     pub fn persist(&self, key: &str) -> bool {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.write().unwrap();
         let now = Instant::now();
         match data.get_mut(key) {
             Some(entry) if entry.is_expired(now) => {
@@ -218,8 +242,11 @@ impl Store {
         }
     }
 
+    /// The primary cleanup mechanism for an expired key that's never
+    /// read or written through again — see [`peek`]'s doc comment for
+    /// why the read path no longer does this itself.
     pub fn sweep_expired(&self) {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.write().unwrap();
         let now = Instant::now();
         data.retain(|_, entry| !entry.is_expired(now));
     }
@@ -230,7 +257,7 @@ impl Store {
     /// `LPUSH key a b c` leaves the list as `c b a`, matching real
     /// Redis (each push lands ahead of the one before it).
     pub fn lpush(&self, key: &str, values: &[Bytes]) -> Result<usize, WrongType> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.write().unwrap();
         let now = Instant::now();
         let entry = vivify(&mut data, key, now, || Value::List(VecDeque::new()));
         let Value::List(list) = &mut entry.value else {
@@ -245,7 +272,7 @@ impl Store {
     /// Pushes each of `values` to the *back*, in order — `RPUSH key a b
     /// c` leaves the list as `a b c`.
     pub fn rpush(&self, key: &str, values: &[Bytes]) -> Result<usize, WrongType> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.write().unwrap();
         let now = Instant::now();
         let entry = vivify(&mut data, key, now, || Value::List(VecDeque::new()));
         let Value::List(list) = &mut entry.value else {
@@ -257,10 +284,10 @@ impl Store {
         Ok(list.len())
     }
 
+    /// Pure read path — see [`peek`].
     pub fn lrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<Bytes>, WrongType> {
-        let mut data = self.data.lock().unwrap();
-        let now = Instant::now();
-        let Some(entry) = touch(&mut data, key, now) else {
+        let data = self.data.read().unwrap();
+        let Some(entry) = peek(&data, key, Instant::now()) else {
             return Ok(Vec::new());
         };
         let Value::List(list) = &entry.value else {
@@ -276,7 +303,7 @@ impl Store {
     /// removed entirely — an empty list isn't a value real Redis (or
     /// this one) leaves lying around.
     pub fn lpop(&self, key: &str) -> Result<Option<Bytes>, WrongType> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.write().unwrap();
         let now = Instant::now();
         let Some(entry) = touch(&mut data, key, now) else {
             return Ok(None);
@@ -299,7 +326,7 @@ impl Store {
     /// reply of "how many new fields," for the single-field form this
     /// stage implements.
     pub fn hset(&self, key: &str, field: String, value: Bytes) -> Result<bool, WrongType> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.write().unwrap();
         let now = Instant::now();
         let entry = vivify(&mut data, key, now, || Value::Hash(HashMap::new()));
         let Value::Hash(hash) = &mut entry.value else {
@@ -308,10 +335,10 @@ impl Store {
         Ok(hash.insert(field, value).is_none())
     }
 
+    /// Pure read path — see [`peek`].
     pub fn hget(&self, key: &str, field: &str) -> Result<Option<Bytes>, WrongType> {
-        let mut data = self.data.lock().unwrap();
-        let now = Instant::now();
-        let Some(entry) = touch(&mut data, key, now) else {
+        let data = self.data.read().unwrap();
+        let Some(entry) = peek(&data, key, Instant::now()) else {
             return Ok(None);
         };
         let Value::Hash(hash) = &entry.value else {
@@ -320,10 +347,10 @@ impl Store {
         Ok(hash.get(field).cloned())
     }
 
+    /// Pure read path — see [`peek`].
     pub fn hgetall(&self, key: &str) -> Result<Vec<(String, Bytes)>, WrongType> {
-        let mut data = self.data.lock().unwrap();
-        let now = Instant::now();
-        let Some(entry) = touch(&mut data, key, now) else {
+        let data = self.data.read().unwrap();
+        let Some(entry) = peek(&data, key, Instant::now()) else {
             return Ok(Vec::new());
         };
         let Value::Hash(hash) = &entry.value else {
@@ -335,7 +362,7 @@ impl Store {
     /// Removes the given fields, returning how many were actually
     /// present. If that empties the hash, the key is removed entirely.
     pub fn hdel(&self, key: &str, fields: &[String]) -> Result<usize, WrongType> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.write().unwrap();
         let now = Instant::now();
         let Some(entry) = touch(&mut data, key, now) else {
             return Ok(0);
@@ -356,7 +383,7 @@ impl Store {
     /// Adds each of `members` that isn't already present, returning how
     /// many were newly added.
     pub fn sadd(&self, key: &str, members: &[Bytes]) -> Result<usize, WrongType> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.write().unwrap();
         let now = Instant::now();
         let entry = vivify(&mut data, key, now, || Value::Set(HashSet::new()));
         let Value::Set(set) = &mut entry.value else {
@@ -370,7 +397,7 @@ impl Store {
     /// were actually removed. If that empties the set, the key is
     /// removed entirely.
     pub fn srem(&self, key: &str, members: &[Bytes]) -> Result<usize, WrongType> {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.write().unwrap();
         let now = Instant::now();
         let Some(entry) = touch(&mut data, key, now) else {
             return Ok(0);
@@ -386,10 +413,10 @@ impl Store {
         Ok(removed)
     }
 
+    /// Pure read path — see [`peek`].
     pub fn smembers(&self, key: &str) -> Result<Vec<Bytes>, WrongType> {
-        let mut data = self.data.lock().unwrap();
-        let now = Instant::now();
-        let Some(entry) = touch(&mut data, key, now) else {
+        let data = self.data.read().unwrap();
+        let Some(entry) = peek(&data, key, Instant::now()) else {
             return Ok(Vec::new());
         };
         let Value::Set(set) = &entry.value else {
@@ -398,10 +425,10 @@ impl Store {
         Ok(set.iter().cloned().collect())
     }
 
+    /// Pure read path — see [`peek`].
     pub fn sismember(&self, key: &str, member: &[u8]) -> Result<bool, WrongType> {
-        let mut data = self.data.lock().unwrap();
-        let now = Instant::now();
-        let Some(entry) = touch(&mut data, key, now) else {
+        let data = self.data.read().unwrap();
+        let Some(entry) = peek(&data, key, Instant::now()) else {
             return Ok(false);
         };
         let Value::Set(set) = &entry.value else {
@@ -412,7 +439,7 @@ impl Store {
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.data.lock().unwrap().len()
+        self.data.read().unwrap().len()
     }
 }
 
@@ -475,6 +502,43 @@ mod tests {
         });
         let value = store.get("shared").unwrap().unwrap();
         assert!(value.iter().all(|&b| b == value[0]));
+    }
+
+    /// New in the RwLock migration: many threads concurrently reading
+    /// the same key (a plain value here, but `peek` is the same code
+    /// path every read-only method uses) must all see a consistent
+    /// value via the shared read lock.
+    #[test]
+    fn concurrent_reads_of_the_same_key_are_all_consistent() {
+        let store = Store::new();
+        store.set("shared".to_string(), vec![9u8; 64]);
+
+        thread::scope(|scope| {
+            for _ in 0..32 {
+                let store = &store;
+                scope.spawn(move || {
+                    assert_eq!(store.get("shared"), Ok(Some(vec![9u8; 64])));
+                });
+            }
+        });
+    }
+
+    /// An expired key is invisible to reads immediately, but — unlike
+    /// before the RwLock migration — reading it doesn't physically
+    /// remove it; only a write-path touch or the sweep does.
+    #[test]
+    fn an_expired_key_lingers_physically_until_a_write_path_operation_or_sweep_touches_it() {
+        let store = Store::new();
+        store.set("k".to_string(), b"v".to_vec());
+        store.expire("k", Duration::from_millis(1));
+        thread::sleep(Duration::from_millis(20));
+
+        assert_eq!(store.get("k"), Ok(None));
+        assert_eq!(store.ttl("k"), None);
+        assert_eq!(store.len(), 1, "the expired entry should still physically occupy its map slot");
+
+        store.sweep_expired();
+        assert_eq!(store.len(), 0);
     }
 
     // ---- lists ------------------------------------------------------

@@ -1,43 +1,56 @@
-//! The shared, thread-safe key-value store. A single `Mutex` around one
-//! `HashMap` is the simplest possible answer to "many connection threads
-//! need to read and mutate the same data" — correct, and the obvious
-//! bottleneck every later stage either lives with or works around
-//! (stage 7's async rewrite still starts from this same shape).
-
+//! The shared, thread-safe key-value store. A single `RwLock` around one
+//! `HashMap` is the answer to "many connection threads need to read and
+//! mutate the same data" — `GET` (the most common operation by far in a
+//! typical KV workload) takes a shared read lock and can run concurrently
+//! with other reads; `SET`/`DEL` take an exclusive write lock, same as a
+//! `Mutex` would give them.
+//!
+//! Worth being honest about what this buys and doesn't: a `RwLock` isn't
+//! simply "better" than a `Mutex` — uncontended, it's usually a little
+//! *more* expensive per call (more internal bookkeeping to distinguish
+//! shared vs. exclusive access), and `std::sync::RwLock` makes no
+//! fairness guarantee, so a write could in principle be starved by a
+//! steady stream of concurrent reads on some platforms. The payoff is
+//! real concurrency between simultaneous reads instead of every `GET`
+//! serializing behind every other `GET` — but it's still one lock over
+//! the *entire* keyspace, so a `SET` to one key still blocks a `GET` of
+//! a completely unrelated one either way. That deeper bottleneck is
+//! what stage 11's benchmark is actually for; this is a smaller,
+//! orthogonal improvement, not a fix for it.
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 pub type Bytes = Vec<u8>;
 
 pub struct Store {
-    data: Mutex<HashMap<String, Bytes>>,
+    data: RwLock<HashMap<String, Bytes>>,
 }
 
 impl Store {
     pub fn new() -> Self {
         Store {
-            data: Mutex::new(HashMap::new()),
+            data: RwLock::new(HashMap::new()),
         }
     }
 
     pub fn get(&self, key: &str) -> Option<Bytes> {
-        self.data.lock().unwrap().get(key).cloned()
+        self.data.read().unwrap().get(key).cloned()
     }
 
     pub fn set(&self, key: String, value: Bytes) {
-        self.data.lock().unwrap().insert(key, value);
+        self.data.write().unwrap().insert(key, value);
     }
 
     /// Removes every key in `keys` that's present, returning how many
     /// actually existed (matches `DEL`'s reply semantics).
     pub fn del(&self, keys: &[String]) -> usize {
-        let mut data = self.data.lock().unwrap();
+        let mut data = self.data.write().unwrap();
         keys.iter().filter(|k| data.remove(k.as_str()).is_some()).count()
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.data.lock().unwrap().len()
+        self.data.read().unwrap().len()
     }
 }
 
