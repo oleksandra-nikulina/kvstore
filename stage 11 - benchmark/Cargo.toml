@@ -3,4 +3,9 @@ name = "kvstore-stage11"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "bench"
+path = "src/main.rs"
+
 [dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
