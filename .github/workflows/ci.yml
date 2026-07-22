@@ -32,15 +32,29 @@ jobs:
         with:
           components: clippy
 
+      # Deliberately does NOT cache `target/`. It did originally, keyed
+      # only on Cargo.lock's hash (which barely ever changes, since
+      # dependencies rarely do) — meaning almost every push restored a
+      # `target/` from a *previous* commit's source and did an
+      # incremental rebuild on top of it. Rust's incremental compilation
+      # is usually safe, but stale-artifact corruption producing wrong
+      # *runtime* behavior with no compile error is a real, documented
+      # category of bug, and it's exactly the shape of one real failure
+      # this workflow produced: a test failed once in CI, immediately,
+      # non-reproducibly, and passed cleanly on every one of 150 local
+      # runs against a fresh build. Caching the registry/git download
+      # cache is safe (those are immutable once downloaded, never
+      # recompiled by this project's own changing source) and is where
+      # nearly all the setup time actually goes for a handful of small
+      # dependencies like this project has, so it's kept.
       - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ${{ matrix.stage }}/target
-          key: ${{ runner.os }}-cargo-${{ matrix.stage }}-${{ hashFiles(format('{0}/Cargo.lock', matrix.stage)) }}
+          key: ${{ runner.os }}-cargo-deps-${{ matrix.stage }}-${{ hashFiles(format('{0}/Cargo.lock', matrix.stage)) }}
           restore-keys: |
-            ${{ runner.os }}-cargo-${{ matrix.stage }}-
+            ${{ runner.os }}-cargo-deps-${{ matrix.stage }}-
 
       - name: cargo test
         working-directory: ${{ matrix.stage }}
