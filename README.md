@@ -1,9 +1,39 @@
 # kvstore
 
+[![CI](https://github.com/oleksandra-nikulina/kvstore/actions/workflows/ci.yml/badge.svg)](https://github.com/oleksandra-nikulina/kvstore/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A simplified Redis-like in-memory key-value store, built from scratch in
 Rust and grown, one stage at a time, from a blocking single-connection TCP
 server into a multi-type, persistent, Pub/Sub-capable store with a
 production-shaped concurrency model.
+
+## Quickstart
+
+Every stage is a full, standalone, real RESP server — this is the most
+complete one (stage 10: data types, expiration, persistence, Pub/Sub,
+and memory-bounded eviction):
+
+```sh
+git clone https://github.com/oleksandra-nikulina/kvstore.git
+cd "kvstore/stage 10 - eviction"
+cargo run --release -- 6379
+```
+
+Then, in another terminal, talk to it with any real Redis client —
+`redis-cli` here, but the wire protocol is genuinely RESP, so anything
+that speaks Redis works:
+
+```sh
+redis-cli -p 6379 SET foo bar
+redis-cli -p 6379 GET foo
+redis-cli -p 6379 LPUSH mylist a b c
+redis-cli -p 6379 LRANGE mylist 0 -1
+redis-cli -p 6379 EXPIRE foo 60
+redis-cli -p 6379 TTL foo
+```
+
+To run every stage's test suite in one command: `./scripts/test-all.sh`.
 
 ## Why this project
 
@@ -29,9 +59,15 @@ purpose — so the thread-based and async-based concurrency models exist
 side by side and can be compared directly, on the same protocol and the
 same command set, instead of one being taken on faith. Stages 8-10 layer
 persistence (an append-only file), Pub/Sub, and memory-bounded eviction
-(LRU/LFU) on top of the async core. Stage 11 benchmarks the
-thread-per-connection version against the async version, and both against
-real `redis-benchmark` traffic against real Redis.
+(LRU/LFU) on top of the async core — and, along the way, `Store` is
+retrofitted from `Mutex` to `RwLock` across stages 4-9, so concurrent
+reads (`GET`, `LRANGE`, ...) can run in parallel while writes
+(`SET`, `DEL`, ...) stay exclusive. Stage 11 is a hand-rolled RESP load
+generator (not a `redis-benchmark` wrapper — the same tool measures this
+project's own servers *and* real Redis, since they speak the same wire
+protocol) benchmarking the thread-per-connection version against the
+async version, the cost of the `RwLock` split under real contention, and
+this project against real Redis.
 
 Each stage folder is a full standalone Cargo project — not a diff against
 the last — so you can `cd` into any stage, `cargo run` it, and read it in
@@ -45,6 +81,8 @@ constraints this project holds itself to.
 ## What this isn't
 
 Not a production data store — no clustering, no replication, no
-RDB-compatible binary persistence format, no sharded or lock-free
-internals. The goal was to understand what Redis is actually doing under
-each of those headline features, not to replace it.
+RDB-compatible binary persistence format, no sharded internals (every
+stage's `Store` is one lock over the entire keyspace — see stage 11's
+benchmark for what that actually costs, measured, not assumed). The goal
+was to understand what Redis is actually doing under each of those
+headline features, not to replace it.

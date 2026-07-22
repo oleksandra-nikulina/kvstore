@@ -16,10 +16,18 @@ mutable state safely across threads/tasks" as a first-class question at
 every stage where it applies, not an afterthought.
 
 Concurrency gets studied twice on purpose: once with OS threads
-(`std::thread` + `Mutex`, stages 2-6), once with async tasks (`tokio`,
-stages 7-10). Same protocol, same command set, two different answers to
-"how do I serve many clients at once" — so the trade-off is observed
-directly (stage 11's benchmark) rather than asserted.
+(`std::thread`, stages 2-6), once with async tasks (`tokio`, stages
+7-10). Same protocol, same command set, two different answers to "how
+do I serve many clients at once" — so the trade-off is observed
+directly (stage 11's benchmark) rather than asserted. `Store`'s own
+locking got a second look too, after stages 4-9 were already built: a
+design review found it had reasoned carefully about *which kind* of
+mutex to use but never asked *whether* a mutex (as opposed to a
+`RwLock`) was the right primitive at all — `Store` was retrofitted from
+`Mutex` to `RwLock` across every stage from 4 onward as a result (see
+`DESIGN_TRADEOFFS_NOTES.md`, gitignored, for the full reasoning, and
+stage 11's benchmark for what that retrofit actually measured under
+load).
 
 ## Constraints this project holds itself to
 
@@ -91,10 +99,13 @@ directly (stage 11's benchmark) rather than asserted.
    stage where the server speaks real Redis protocol — testable directly
    with `redis-cli -p <port>`.
 4. **Core KV store.** `GET`/`SET`/`DEL` backed by `HashMap<String, Bytes>`
-   behind `Arc<Mutex<..>>`, shared across the threads from stage 2. This
-   is where "many connections" (stage 2) and "shared data" (this stage)
-   meet, and where a real check-then-act race becomes possible for the
-   first time — the stress tests start here.
+   shared across the threads from stage 2 — originally behind
+   `Arc<Mutex<..>>`, later retrofitted to `Arc<RwLock<..>>` (see the
+   concurrency note above) so concurrent `GET`s can run in parallel
+   while `SET`/`DEL` stay exclusive. This is where "many connections"
+   (stage 2) and "shared data" (this stage) meet, and where a real
+   check-then-act race becomes possible for the first time — the stress
+   tests start here.
 5. **Expiration.** `EXPIRE` / `PEXPIRE` / `TTL` / `PERSIST`; lazy expiry
    (checked on read) plus a background sweep thread for keys that are
    never read again but still need to disappear.
@@ -115,8 +126,11 @@ directly (stage 11's benchmark) rather than asserted.
    — a natural fit once the core is already async.
 10. **Eviction.** A configurable memory cap and an LRU/LFU eviction policy
     for what happens when it's hit.
-11. **Benchmark.** The thread-per-connection store (stage 6) against the
-    async store (stage 10) under concurrent load — same workload, same
-    machine — and both against real `redis-benchmark` traffic against
-    real Redis, to see honestly what this project's simplified version
+11. **Benchmark.** A hand-rolled RESP load generator (not a
+    `redis-benchmark` wrapper — `SET`/`GET` are identical wire traffic
+    whether the target is this project or real Redis, so one tool
+    measures both) comparing the thread-per-connection store against the
+    async store, the measured cost of the `RwLock` retrofit under real
+    contention, and this project against real Redis — same workload,
+    same machine, to see honestly what this project's simplified version
     costs in throughput and latency.
