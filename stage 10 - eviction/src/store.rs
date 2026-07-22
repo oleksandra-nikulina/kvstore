@@ -281,10 +281,15 @@ impl Store {
         let Some(entry) = peek(&data, key, Instant::now()) else {
             return Ok(None);
         };
-        let result = match &entry.value {
-            Value::Bytes(b) => Ok(Some(b.clone())),
-            _ => Err(WrongType),
+        let Value::Bytes(b) = &entry.value else {
+            // Found something, but not the right shape - matches every
+            // other typed read (lrange/hget/hgetall/smembers/sismember):
+            // a WRONGTYPE doesn't count as a successful access. Found
+            // by review: this used to fall through to record_access
+            // unconditionally, inconsistent with all five siblings.
+            return Err(WrongType);
         };
+        let result = Ok(Some(b.clone()));
         drop(data);
         self.record_access(key);
         result
@@ -800,6 +805,38 @@ mod tests {
         assert_eq!(store.hset("s", "f".to_string(), b"v".to_vec()), Err(WrongType));
         assert_eq!(store.sadd("s", &[b"x".to_vec()]), Err(WrongType));
         assert_eq!(store.get("s"), Ok(Some(b"v".to_vec())));
+    }
+
+    /// Regression test for a bug found in review: `get()` used to call
+    /// `record_access` even when the key turned out to be the wrong
+    /// type, inconsistent with every sibling read method
+    /// (`lrange`/`hget`/`hgetall`/`smembers`/`sismember`), all of which
+    /// only count a genuinely successful read as an access. A failed
+    /// `GET` on a list key shouldn't be able to protect that key from
+    /// eviction.
+    #[test]
+    fn a_wrongtype_get_does_not_count_as_an_access_for_eviction() {
+        // "list-key"(8)+"x"(1)=9 bytes; "other"(5)+5=10 bytes; total 19,
+        // comfortably under a 35-byte cap so setup itself never evicts.
+        let store = Store::with_eviction(35, Policy::Lru);
+        store.rpush("list-key", &[b"x".to_vec()]).unwrap();
+        store.set("other".to_string(), vec![0u8; 5]);
+
+        // Repeatedly (and unsuccessfully) GET the list key - none of
+        // these should count as an access.
+        for _ in 0..10 {
+            assert_eq!(store.get("list-key"), Err(WrongType));
+        }
+
+        // "list-key" was touched once, by rpush, before "other" was
+        // set - so it's still the least recently used entry despite the
+        // 10 failed GETs. "new-key"(7)+10=17; 19+17=36, over the
+        // 35-byte cap by 1 - evicting list-key's 9 bytes alone
+        // (36-9=27) is enough, so exactly it (not "other") is evicted.
+        store.set("new-key".to_string(), vec![0u8; 10]);
+
+        assert_eq!(store.lrange("list-key", 0, -1), Ok(Vec::new()), "list-key should have been evicted");
+        assert_eq!(store.get("other"), Ok(Some(vec![0u8; 5])));
     }
 
     // ---- byte accounting -------------------------------------------
