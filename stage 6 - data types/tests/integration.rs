@@ -187,7 +187,7 @@ fn wrongtype_error_over_the_wire_and_the_connection_stays_usable() {
 }
 
 /// Many separate client connections concurrently `RPUSH`ing to the same
-/// list. `Mutex`-protected access means every push is atomic, so the
+/// list. `RwLock`-protected access means every push is atomic, so the
 /// final list must contain exactly one entry per push — none lost,
 /// none duplicated, none corrupted — proven through the real socket
 /// stack, not just against the `Store` API directly.

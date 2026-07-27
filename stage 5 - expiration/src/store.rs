@@ -23,10 +23,23 @@
 //! ceiling — that needs sharding, which this project doesn't do.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{LockResult, RwLock};
 use std::time::{Duration, Instant};
 
 pub type Bytes = Vec<u8>;
+
+/// Takes a lock guard even if the lock was poisoned by a panic in some
+/// other critical section. `RwLock::read`/`write` return `Err`
+/// specifically to warn that the shared data *might* be left
+/// mid-mutation after a panic — but every critical section in this
+/// store is a plain, infallible operation that can't actually panic, so
+/// propagating that as a fresh panic here would only ever cascade an
+/// unrelated failure into every other client's next request too.
+/// Recovering and continuing is the safer default for a server that
+/// should stay up for everyone else.
+fn recover<T>(result: LockResult<T>) -> T {
+    result.unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 struct Entry {
     value: Bytes,
@@ -79,14 +92,14 @@ impl Store {
     }
 
     pub fn get(&self, key: &str) -> Option<Bytes> {
-        let data = self.data.read().unwrap();
+        let data = recover(self.data.read());
         peek(&data, key, Instant::now()).map(|entry| entry.value.clone())
     }
 
     /// A full overwrite, so — same as real Redis's plain `SET` — any TTL
     /// the key previously had is cleared along with the old value.
     pub fn set(&self, key: String, value: Bytes) {
-        self.data.write().unwrap().insert(
+        recover(self.data.write()).insert(
             key,
             Entry {
                 value,
@@ -100,7 +113,7 @@ impl Store {
     /// already-expired key is treated as absent even if it hasn't been
     /// swept yet, same as `GET` would treat it.
     pub fn del(&self, keys: &[String]) -> usize {
-        let mut data = self.data.write().unwrap();
+        let mut data = recover(self.data.write());
         let now = Instant::now();
         let mut removed = 0;
         for key in keys {
@@ -122,7 +135,7 @@ impl Store {
     /// overflow, so this uses `checked_add` and reports that case
     /// explicitly instead of taking down the connection thread.
     pub fn expire(&self, key: &str, ttl: Duration) -> ExpireResult {
-        let mut data = self.data.write().unwrap();
+        let mut data = recover(self.data.write());
         let now = Instant::now();
         match data.get_mut(key) {
             Some(entry) if !entry.is_expired(now) => match now.checked_add(ttl) {
@@ -144,7 +157,7 @@ impl Store {
     /// it exists but has no TTL; `Some(Some(remaining))` otherwise. Pure
     /// read path — see [`peek`].
     pub fn ttl(&self, key: &str) -> Option<Option<Duration>> {
-        let data = self.data.read().unwrap();
+        let data = recover(self.data.read());
         let now = Instant::now();
         peek(&data, key, now)
             .map(|entry| entry.expires_at.map(|at| at.saturating_duration_since(now)))
@@ -154,7 +167,7 @@ impl Store {
     /// actually removed (matching `PERSIST`'s reply semantics: `false`
     /// for a missing key, a persistent key, or an already-expired key).
     pub fn persist(&self, key: &str) -> bool {
-        let mut data = self.data.write().unwrap();
+        let mut data = recover(self.data.write());
         let now = Instant::now();
         match data.get_mut(key) {
             Some(entry) if entry.is_expired(now) => {
@@ -177,14 +190,14 @@ impl Store {
     /// read path (`get`/`ttl`) no longer removes expired entries itself
     /// — see [`peek`].
     pub fn sweep_expired(&self) {
-        let mut data = self.data.write().unwrap();
+        let mut data = recover(self.data.write());
         let now = Instant::now();
         data.retain(|_, entry| !entry.is_expired(now));
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.data.read().unwrap().len()
+        recover(self.data.read()).len()
     }
 }
 
@@ -203,6 +216,25 @@ mod tests {
     fn get_on_a_missing_key_is_none() {
         let store = Store::new();
         assert_eq!(store.get("missing"), None);
+    }
+
+    #[test]
+    fn get_and_set_still_work_after_the_lock_is_poisoned() {
+        let store = Store::new();
+        store.set("k".to_string(), b"v".to_vec());
+
+        // Poison the lock by panicking while holding it.
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = store.data.write().unwrap();
+            panic!("simulated panic while holding the write lock");
+        });
+
+        // A cascading `.unwrap()` here would mean one unrelated panic
+        // takes down every other client's next request too — recovery
+        // means it doesn't.
+        assert_eq!(store.get("k"), Some(b"v".to_vec()));
+        store.set("k2".to_string(), b"v2".to_vec());
+        assert_eq!(store.get("k2"), Some(b"v2".to_vec()));
     }
 
     #[test]

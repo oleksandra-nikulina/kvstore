@@ -136,7 +136,7 @@ fn many_concurrent_clients_set_and_get_their_own_key_without_interference() {
 }
 
 /// Many separate client connections racing to `SET` the *same* key at
-/// once. The store's `Mutex` guarantees each `SET` is atomic end to end,
+/// once. The store's `RwLock` guarantees each `SET` is atomic end to end,
 /// so the final value must be exactly one writer's full value — never a
 /// corrupted mix of two — proving that guarantee holds through the real
 /// network/protocol stack, not just at the `Store` API directly.

@@ -121,7 +121,17 @@ pub fn parse_multibulk(buf: &[u8]) -> Result<ParseResult, ProtocolError> {
     }
 
     let mut pos = 1 + header_len;
-    let mut args = Vec::with_capacity(count as usize);
+    // Capped, not `Vec::with_capacity(count as usize)` directly: `count`
+    // is still just a client-declared header at this point, nothing
+    // about it has arrived yet. A 13-byte `*1048576\r\n` alone would
+    // otherwise reserve ~24MB (`Bytes` is 24 bytes on a 64-bit target)
+    // for a connection that could then send nothing further — real
+    // commands have a handful of arguments at most, so a small cap
+    // costs nothing for legitimate traffic and lets the `Vec` grow
+    // normally (amortized O(1) per push) for anything larger instead
+    // of pre-paying for a client's unverified claim.
+    const INITIAL_ARGS_CAPACITY: usize = 128;
+    let mut args = Vec::with_capacity((count as usize).min(INITIAL_ARGS_CAPACITY));
     for _ in 0..count {
         if pos >= buf.len() {
             return Ok(ParseResult::Incomplete);

@@ -18,12 +18,25 @@
 //! what stage 11's benchmark is actually for; this is a smaller,
 //! orthogonal improvement, not a fix for it.
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{LockResult, RwLock};
 
 pub type Bytes = Vec<u8>;
 
 pub struct Store {
     data: RwLock<HashMap<String, Bytes>>,
+}
+
+/// Takes a lock guard even if the lock was poisoned by a panic in some
+/// other critical section. `RwLock::read`/`write` return `Err`
+/// specifically to warn that the shared data *might* be left
+/// mid-mutation after a panic — but every critical section in this
+/// store is a plain, infallible `HashMap` operation that can't actually
+/// panic, so propagating that as a fresh panic here would only ever
+/// cascade an unrelated failure into every other client's next request
+/// too. Recovering and continuing is the safer default for a server
+/// that should stay up for everyone else.
+fn recover<T>(result: LockResult<T>) -> T {
+    result.unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 impl Store {
@@ -34,17 +47,17 @@ impl Store {
     }
 
     pub fn get(&self, key: &str) -> Option<Bytes> {
-        self.data.read().unwrap().get(key).cloned()
+        recover(self.data.read()).get(key).cloned()
     }
 
     pub fn set(&self, key: String, value: Bytes) {
-        self.data.write().unwrap().insert(key, value);
+        recover(self.data.write()).insert(key, value);
     }
 
     /// Removes every key in `keys` that's present, returning how many
     /// actually existed (matches `DEL`'s reply semantics).
     pub fn del(&self, keys: &[String]) -> usize {
-        let mut data = self.data.write().unwrap();
+        let mut data = recover(self.data.write());
         keys.iter()
             .filter(|k| data.remove(k.as_str()).is_some())
             .count()
@@ -52,7 +65,7 @@ impl Store {
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.data.read().unwrap().len()
+        recover(self.data.read()).len()
     }
 }
 
@@ -101,8 +114,28 @@ mod tests {
         assert_eq!(store.get("b"), None);
     }
 
+    #[test]
+    fn get_and_set_still_work_after_the_lock_is_poisoned() {
+        let store = Store::new();
+        store.set("k".to_string(), b"v".to_vec());
+
+        // Poison the lock by panicking while holding it.
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = store.data.write().unwrap();
+            panic!("simulated panic while holding the write lock");
+        });
+
+        // A cascading `.unwrap()` here would mean one unrelated panic
+        // takes down every other client's next request too — recovery
+        // means it doesn't.
+        assert_eq!(store.get("k"), Some(b"v".to_vec()));
+        store.set("k2".to_string(), b"v2".to_vec());
+        assert_eq!(store.get("k2"), Some(b"v2".to_vec()));
+    }
+
     /// Many threads racing to `SET` the *same* key concurrently. The
-    /// `Mutex` guarantees each individual `insert` is atomic, so after
+    /// `RwLock`'s exclusive write lock guarantees each individual `insert`
+    /// is atomic, so after
     /// every thread finishes the key must hold exactly one of the
     /// written values in full — never a corrupted/torn mix of two.
     #[test]

@@ -22,7 +22,19 @@ cargo run --release -- 6379
 
 Then, in another terminal, talk to it with any real Redis client —
 `redis-cli` here, but the wire protocol is genuinely RESP, so anything
-that speaks Redis works:
+that speaks Redis works. If you don't already have `redis-cli`
+installed, it ships as part of Redis itself:
+
+```sh
+# macOS
+brew install redis
+
+# Debian/Ubuntu
+sudo apt install redis-tools
+
+# Fedora
+sudo dnf install redis
+```
 
 ```sh
 redis-cli -p 6379 SET foo bar
