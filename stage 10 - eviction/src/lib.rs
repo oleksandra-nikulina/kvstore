@@ -16,10 +16,14 @@ use std::time::Duration;
 use store::Store;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Semaphore, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 const SWEEP_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The default cap on concurrent connections `run()` uses — same
+/// reasoning as stage 7-9's `tokio::sync::Semaphore`.
+const MAX_CONNECTIONS: usize = 1024;
 
 /// Every command this connection is currently subscribed to, and the
 /// forwarder task relaying that channel's broadcast messages into this
@@ -79,11 +83,17 @@ async fn serve(
         // Drain and dispatch every complete command already buffered —
         // same buffer-then-parse-repeatedly shape every earlier stage
         // used — before waiting for more input *or* a pushed message.
+        // `pos` tracks how much of `buf` is already consumed without
+        // physically removing it yet; compacting once per outer
+        // iteration (right before the `select!`) rather than once per
+        // command keeps this linear in bytes processed, not quadratic
+        // in a heavily pipelined batch's size.
+        let mut pos = 0;
         loop {
-            match read_command(&buf) {
+            match read_command(&buf[pos..]) {
                 Ok(ReadResult::Incomplete) => break,
                 Ok(ReadResult::Empty { consumed }) => {
-                    buf.drain(0..consumed);
+                    pos += consumed;
                 }
                 Ok(ReadResult::Command { command, consumed }) => {
                     dispatch(
@@ -96,7 +106,7 @@ async fn serve(
                         &push_tx,
                     )
                     .await?;
-                    buf.drain(0..consumed);
+                    pos += consumed;
                 }
                 Err(e) => {
                     let reply = Reply::Error(format!("ERR Protocol error: {e}"));
@@ -104,6 +114,9 @@ async fn serve(
                     return Ok(());
                 }
             }
+        }
+        if pos > 0 {
+            buf.drain(0..pos);
         }
 
         // The one new idea this stage adds to every earlier
@@ -253,13 +266,17 @@ fn spawn_forwarder(
 
 /// Accepts connections forever, one `tokio` task per connection, all
 /// sharing one `Store`, one `Aof`, and one `PubSub` registry — plus the
-/// background expiry sweep from stage 7/8, unchanged.
+/// background expiry sweep from stage 7/8, unchanged. Caps concurrent
+/// connections at [`MAX_CONNECTIONS`]; see stage 2's `run_with_limit`
+/// notes for why a cap exists at all.
 pub async fn run(
     listener: TcpListener,
     store: Arc<Store>,
     aof: Arc<Aof>,
     pubsub: Arc<PubSub>,
 ) -> io::Result<()> {
+    let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+
     {
         let store = Arc::clone(&store);
         tokio::spawn(async move {
@@ -271,11 +288,25 @@ pub async fn run(
     }
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                eprintln!("accept error: {e}");
+                // A persistently failing accept() would otherwise
+                // busy-spin this loop.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let store = Arc::clone(&store);
         let aof = Arc::clone(&aof);
         let pubsub = Arc::clone(&pubsub);
+        let permit = Arc::clone(&semaphore)
+            .acquire_owned()
+            .await
+            .expect("semaphore is never closed");
         tokio::spawn(async move {
+            let _permit = permit; // held for the connection's whole lifetime
             if let Err(e) = handle_connection(stream, store, aof, pubsub).await {
                 eprintln!("connection error: {e}");
             }

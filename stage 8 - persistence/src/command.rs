@@ -334,13 +334,18 @@ pub fn execute(command: &Command, store: &Store) -> Reply {
         Command::NotAnInteger => {
             Reply::Error("ERR value is not an integer or out of range".to_string())
         }
-        Command::Unknown(name) => Reply::Error(format!(
-            "ERR unknown command '{}'",
-            String::from_utf8_lossy(name)
-        )),
+        // `name` is attacker-controlled and RESP bulk strings are
+        // binary-safe, so it can contain a raw \r\n — embedding it
+        // unescaped here would let a crafted command name split this
+        // single-line reply into two, corrupting the connection's
+        // framing. `escape_ascii` turns any such bytes into literal
+        // `\r`/`\n` text instead of the control bytes themselves.
+        Command::Unknown(name) => {
+            Reply::Error(format!("ERR unknown command '{}'", name.escape_ascii()))
+        }
         Command::WrongArity(name) => Reply::Error(format!(
             "ERR wrong number of arguments for '{}' command",
-            String::from_utf8_lossy(name).to_lowercase()
+            name.to_ascii_lowercase().escape_ascii()
         )),
     }
 }
@@ -440,6 +445,20 @@ mod tests {
             ReadResult::Incomplete => panic!("expected a command, got Incomplete"),
             ReadResult::Empty { .. } => panic!("expected a command, got Empty"),
         }
+    }
+
+    #[test]
+    fn unknown_command_name_containing_crlf_is_escaped_not_embedded_raw() {
+        let store = Store::new();
+        let (cmd, _) = read_one(b"*1\r\n$8\r\nFOO\r\nBAR\r\n");
+        assert_eq!(cmd, Command::Unknown(b"FOO\r\nBAR".to_vec()));
+        let encoded = execute(&cmd, &store).encode();
+        let body = &encoded[1..encoded.len() - 2]; // strip leading '-' and trailing \r\n
+        assert!(
+            !body.windows(2).any(|w| w == b"\r\n"),
+            "reply body must not contain a raw CRLF: {:?}",
+            String::from_utf8_lossy(body)
+        );
     }
 
     #[test]

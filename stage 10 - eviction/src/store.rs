@@ -19,10 +19,23 @@
 use crate::eviction::{Eviction, Policy};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::sync::RwLock;
+use std::sync::{LockResult, RwLock};
 use std::time::{Duration, Instant};
 
 pub type Bytes = Vec<u8>;
+
+/// Takes a lock guard even if the lock was poisoned by a panic in some
+/// other critical section. `RwLock::read`/`write` return `Err`
+/// specifically to warn that the shared data *might* be left
+/// mid-mutation after a panic — but every critical section in this
+/// store is a plain, infallible operation that can't actually panic, so
+/// propagating that as a fresh panic here would only ever cascade an
+/// unrelated failure into every other client's next request too.
+/// Recovering and continuing is the safer default for a server that
+/// should stay up for everyone else.
+fn recover<T>(result: LockResult<T>) -> T {
+    result.unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Hash field names and set/list members are modeled as `Bytes`
 /// (binary-safe, like real Redis); hash *field names* are `String` for
@@ -274,14 +287,14 @@ impl Store {
     fn maybe_evict(&self, protect: Option<&str>) {
         let Some(limit) = &self.limit else { return };
         loop {
-            let over_cap = self.data.read().unwrap().approx_bytes > limit.maxmemory;
+            let over_cap = recover(self.data.read()).approx_bytes > limit.maxmemory;
             if !over_cap {
                 return;
             }
             let Some(victim) = limit.eviction.evict_except(protect) else {
                 return;
             };
-            let mut data = self.data.write().unwrap();
+            let mut data = recover(self.data.write());
             if let Some(entry) = data.map.remove(&victim) {
                 let size = entry_size(&victim, &entry);
                 data.approx_bytes -= size;
@@ -292,7 +305,7 @@ impl Store {
     // ---- plain bytes ----------------------------------------------
 
     pub fn get(&self, key: &str) -> Result<Option<Bytes>, WrongType> {
-        let data = self.data.read().unwrap();
+        let data = recover(self.data.read());
         let Some(entry) = peek(&data, key, Instant::now()) else {
             return Ok(None);
         };
@@ -314,7 +327,7 @@ impl Store {
     /// as real Redis, plain `SET` always succeeds and always leaves the
     /// key holding a string, clearing any TTL it had.
     pub fn set(&self, key: String, value: Bytes) {
-        let mut data = self.data.write().unwrap();
+        let mut data = recover(self.data.write());
         let old_size = data.size_of(&key);
         data.map.insert(
             key.clone(),
@@ -335,7 +348,7 @@ impl Store {
     /// already-expired key is treated as absent even if it hasn't been
     /// swept yet, same as `GET` would treat it.
     pub fn del(&self, keys: &[String]) -> usize {
-        let mut data = self.data.write().unwrap();
+        let mut data = recover(self.data.write());
         let now = Instant::now();
         let mut removed = 0;
         for key in keys {
@@ -360,7 +373,7 @@ impl Store {
     /// `checked_add` and reports that case explicitly instead of taking
     /// down the connection thread.
     pub fn expire(&self, key: &str, ttl: Duration) -> ExpireResult {
-        let mut data = self.data.write().unwrap();
+        let mut data = recover(self.data.write());
         let now = Instant::now();
         let (result, expired_away) = match data.map.get_mut(key) {
             Some(entry) if !entry.is_expired(now) => match now.checked_add(ttl) {
@@ -387,14 +400,14 @@ impl Store {
 
     /// Pure read path — see [`peek`].
     pub fn ttl(&self, key: &str) -> Option<Option<Duration>> {
-        let data = self.data.read().unwrap();
+        let data = recover(self.data.read());
         let now = Instant::now();
         peek(&data, key, now)
             .map(|entry| entry.expires_at.map(|at| at.saturating_duration_since(now)))
     }
 
     pub fn persist(&self, key: &str) -> bool {
-        let mut data = self.data.write().unwrap();
+        let mut data = recover(self.data.write());
         let now = Instant::now();
         let (result, expired_away) = match data.map.get_mut(key) {
             Some(entry) if entry.is_expired(now) => {
@@ -420,7 +433,7 @@ impl Store {
     /// The primary cleanup mechanism for an expired key that's never
     /// read or written through again — see [`peek`]'s doc comment.
     pub fn sweep_expired(&self) {
-        let mut data = self.data.write().unwrap();
+        let mut data = recover(self.data.write());
         let now = Instant::now();
         let expired_keys: Vec<String> = data
             .map
@@ -447,7 +460,7 @@ impl Store {
     /// `LPUSH key a b c` leaves the list as `c b a`, matching real
     /// Redis (each push lands ahead of the one before it).
     pub fn lpush(&self, key: &str, values: &[Bytes]) -> Result<usize, WrongType> {
-        let mut data = self.data.write().unwrap();
+        let mut data = recover(self.data.write());
         let now = Instant::now();
         let entry = vivify(&mut data, key, now, || Value::List(VecDeque::new()));
         let old_size = entry_size(key, entry);
@@ -469,7 +482,7 @@ impl Store {
     /// Pushes each of `values` to the *back*, in order — `RPUSH key a b
     /// c` leaves the list as `a b c`.
     pub fn rpush(&self, key: &str, values: &[Bytes]) -> Result<usize, WrongType> {
-        let mut data = self.data.write().unwrap();
+        let mut data = recover(self.data.write());
         let now = Instant::now();
         let entry = vivify(&mut data, key, now, || Value::List(VecDeque::new()));
         let old_size = entry_size(key, entry);
@@ -490,7 +503,7 @@ impl Store {
 
     /// Pure read path — see [`peek`].
     pub fn lrange(&self, key: &str, start: i64, stop: i64) -> Result<Vec<Bytes>, WrongType> {
-        let data = self.data.read().unwrap();
+        let data = recover(self.data.read());
         let Some(entry) = peek(&data, key, Instant::now()) else {
             return Ok(Vec::new());
         };
@@ -510,7 +523,7 @@ impl Store {
     /// removed entirely — an empty list isn't a value real Redis (or
     /// this one) leaves lying around.
     pub fn lpop(&self, key: &str) -> Result<Option<Bytes>, WrongType> {
-        let mut data = self.data.write().unwrap();
+        let mut data = recover(self.data.write());
         let now = Instant::now();
         let Some(entry) = touch(&mut data, key, now) else {
             return Ok(None);
@@ -542,7 +555,7 @@ impl Store {
     /// reply of "how many new fields," for the single-field form this
     /// stage implements.
     pub fn hset(&self, key: &str, field: String, value: Bytes) -> Result<bool, WrongType> {
-        let mut data = self.data.write().unwrap();
+        let mut data = recover(self.data.write());
         let now = Instant::now();
         let entry = vivify(&mut data, key, now, || Value::Hash(HashMap::new()));
         let old_size = entry_size(key, entry);
@@ -560,7 +573,7 @@ impl Store {
 
     /// Pure read path — see [`peek`].
     pub fn hget(&self, key: &str, field: &str) -> Result<Option<Bytes>, WrongType> {
-        let data = self.data.read().unwrap();
+        let data = recover(self.data.read());
         let Some(entry) = peek(&data, key, Instant::now()) else {
             return Ok(None);
         };
@@ -575,7 +588,7 @@ impl Store {
 
     /// Pure read path — see [`peek`].
     pub fn hgetall(&self, key: &str) -> Result<Vec<(String, Bytes)>, WrongType> {
-        let data = self.data.read().unwrap();
+        let data = recover(self.data.read());
         let Some(entry) = peek(&data, key, Instant::now()) else {
             return Ok(Vec::new());
         };
@@ -591,7 +604,7 @@ impl Store {
     /// Removes the given fields, returning how many were actually
     /// present. If that empties the hash, the key is removed entirely.
     pub fn hdel(&self, key: &str, fields: &[String]) -> Result<usize, WrongType> {
-        let mut data = self.data.write().unwrap();
+        let mut data = recover(self.data.write());
         let now = Instant::now();
         let Some(entry) = touch(&mut data, key, now) else {
             return Ok(0);
@@ -623,7 +636,7 @@ impl Store {
     /// Adds each of `members` that isn't already present, returning how
     /// many were newly added.
     pub fn sadd(&self, key: &str, members: &[Bytes]) -> Result<usize, WrongType> {
-        let mut data = self.data.write().unwrap();
+        let mut data = recover(self.data.write());
         let now = Instant::now();
         let entry = vivify(&mut data, key, now, || Value::Set(HashSet::new()));
         let old_size = entry_size(key, entry);
@@ -643,7 +656,7 @@ impl Store {
     /// were actually removed. If that empties the set, the key is
     /// removed entirely.
     pub fn srem(&self, key: &str, members: &[Bytes]) -> Result<usize, WrongType> {
-        let mut data = self.data.write().unwrap();
+        let mut data = recover(self.data.write());
         let now = Instant::now();
         let Some(entry) = touch(&mut data, key, now) else {
             return Ok(0);
@@ -669,7 +682,7 @@ impl Store {
 
     /// Pure read path — see [`peek`].
     pub fn smembers(&self, key: &str) -> Result<Vec<Bytes>, WrongType> {
-        let data = self.data.read().unwrap();
+        let data = recover(self.data.read());
         let Some(entry) = peek(&data, key, Instant::now()) else {
             return Ok(Vec::new());
         };
@@ -684,7 +697,7 @@ impl Store {
 
     /// Pure read path — see [`peek`].
     pub fn sismember(&self, key: &str, member: &[u8]) -> Result<bool, WrongType> {
-        let data = self.data.read().unwrap();
+        let data = recover(self.data.read());
         let Some(entry) = peek(&data, key, Instant::now()) else {
             return Ok(false);
         };
@@ -699,12 +712,12 @@ impl Store {
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.data.read().unwrap().map.len()
+        recover(self.data.read()).map.len()
     }
 
     #[cfg(test)]
     fn approx_bytes(&self) -> usize {
-        self.data.read().unwrap().approx_bytes
+        recover(self.data.read()).approx_bytes
     }
 }
 
@@ -720,6 +733,25 @@ mod tests {
     use std::thread;
 
     // ---- bytes + expiry: unchanged behavior from stage 5-9 --------
+
+    #[test]
+    fn get_and_set_still_work_after_the_lock_is_poisoned() {
+        let store = Store::new();
+        store.set("k".to_string(), b"v".to_vec());
+
+        // Poison the lock by panicking while holding it.
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = store.data.write().unwrap();
+            panic!("simulated panic while holding the write lock");
+        });
+
+        // A cascading `.unwrap()` here would mean one unrelated panic
+        // takes down every other client's next request too — recovery
+        // means it doesn't.
+        assert_eq!(store.get("k"), Ok(Some(b"v".to_vec())));
+        store.set("k2".to_string(), b"v2".to_vec());
+        assert_eq!(store.get("k2"), Ok(Some(b"v2".to_vec())));
+    }
 
     #[test]
     fn set_then_get_round_trips_the_value() {

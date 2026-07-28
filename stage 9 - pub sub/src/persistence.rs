@@ -6,7 +6,7 @@
 //!
 //! Deliberately not attempted here: real Redis's actual AOF format
 //! (which is close to this but not identical), rewrite/compaction of a
-//! growing log, or `fsync` on every write (see `Aof::append`'s doc
+//! growing log, or `fsync` on every write (see `Aof::execute_and_log`'s doc
 //! comment for that trade-off specifically).
 
 use crate::command::{Command, execute};
@@ -102,7 +102,23 @@ pub async fn replay(path: &Path, store: &Store) -> io::Result<usize> {
     loop {
         match read_command(&bytes[pos..]) {
             Ok(ReadResult::Command { command, consumed }) => {
-                execute(&command, store);
+                // A framing-valid entry that still executes to an error
+                // (e.g. a single bit-flip turning a logged `SADD` into
+                // an unrecognized command) parses fine and produces no
+                // `Err` here — nothing about the *shape* of the bytes
+                // looks wrong, only their *meaning*. Left silent, this
+                // would look identical to a harmless read-only no-op:
+                // no diagnostic, and `replayed` would still count it as
+                // if the original write had been faithfully restored.
+                // Unlike a truncated/corrupt trailing entry, this isn't
+                // a signal to stop — the rest of the log is still
+                // structurally intact and worth replaying — so this
+                // logs and continues rather than breaking.
+                if let Reply::Error(e) = execute(&command, store) {
+                    eprintln!(
+                        "AOF: replayed entry executed as an error, state may not match what was originally written: {e}"
+                    );
+                }
                 pos += consumed;
                 replayed += 1;
             }

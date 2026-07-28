@@ -6,7 +6,7 @@
 //!
 //! Deliberately not attempted here: real Redis's actual AOF format
 //! (which is close to this but not identical), rewrite/compaction of a
-//! growing log, or `fsync` on every write (see `Aof::append`'s doc
+//! growing log, or `fsync` on every write (see `Aof::execute_and_log`'s doc
 //! comment for that trade-off specifically).
 
 use crate::command::{Command, execute};
@@ -120,7 +120,23 @@ pub async fn replay(path: &Path, store: &Store) -> io::Result<usize> {
     loop {
         match read_command(&bytes[pos..]) {
             Ok(ReadResult::Command { command, consumed }) => {
-                execute(&command, store);
+                // A framing-valid entry that still executes to an error
+                // (e.g. a single bit-flip turning a logged `SADD` into
+                // an unrecognized command) parses fine and produces no
+                // `Err` here — nothing about the *shape* of the bytes
+                // looks wrong, only their *meaning*. Left silent, this
+                // would look identical to a harmless read-only no-op:
+                // no diagnostic, and `replayed` would still count it as
+                // if the original write had been faithfully restored.
+                // Unlike a truncated/corrupt trailing entry, this isn't
+                // a signal to stop — the rest of the log is still
+                // structurally intact and worth replaying — so this
+                // logs and continues rather than breaking.
+                if let Reply::Error(e) = execute(&command, store) {
+                    eprintln!(
+                        "AOF: replayed entry executed as an error, state may not match what was originally written: {e}"
+                    );
+                }
                 pos += consumed;
                 replayed += 1;
             }
@@ -287,6 +303,54 @@ mod tests {
             "everything before the corrupt entry should still replay"
         );
         assert_eq!(restarted.get("safe"), Ok(Some(b"value".to_vec())));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn replay_continues_past_a_framing_valid_but_unrecognized_entry() {
+        // Regression test (found via code review): unlike a truncated
+        // or garbled trailing entry, a *framing-valid* entry that just
+        // isn't a real command — the kind of corruption a single
+        // bit-flip elsewhere in an otherwise-intact entry could produce
+        // — parses fine and must not stop replay. Everything after it
+        // should still be applied.
+        let path = temp_aof_path("unrecognized-entry");
+
+        {
+            let store = Store::new();
+            let aof = Aof::open(&path).await.unwrap();
+            let before = Command::Set("before".to_string(), b"1".to_vec());
+            aof.execute_and_log(&before, &aof_args(&before).unwrap(), &store)
+                .await;
+        }
+
+        {
+            // Well-formed RESP, but not a recognized command name.
+            use tokio::io::AsyncWriteExt as _;
+            let mut file = OpenOptions::new().append(true).open(&path).await.unwrap();
+            file.write_all(&encode_command(&[b"NOTACOMMAND".to_vec()]))
+                .await
+                .unwrap();
+        }
+
+        {
+            let store = Store::new();
+            let aof = Aof::open(&path).await.unwrap();
+            let after = Command::Set("after".to_string(), b"2".to_vec());
+            aof.execute_and_log(&after, &aof_args(&after).unwrap(), &store)
+                .await;
+        }
+
+        let restarted = Store::new();
+        let replayed = replay(&path, &restarted).await.unwrap();
+
+        assert_eq!(
+            replayed, 3,
+            "the unrecognized entry still counts as replayed — it's not corruption at the byte level, its *meaning* just didn't apply"
+        );
+        assert_eq!(restarted.get("before"), Ok(Some(b"1".to_vec())));
+        assert_eq!(restarted.get("after"), Ok(Some(b"2".to_vec())));
 
         let _ = std::fs::remove_file(&path);
     }

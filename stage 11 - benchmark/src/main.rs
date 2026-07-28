@@ -2,7 +2,7 @@ mod resp_client;
 mod stats;
 mod workload;
 
-use resp_client::{read_reply, send_command};
+use resp_client::{Connection, read_reply, send_command};
 use stats::Stats;
 use std::env;
 use std::io;
@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::process;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::io::BufReader;
 use tokio::net::TcpStream;
 use tokio::sync::Barrier;
 use workload::Workload;
@@ -118,6 +119,21 @@ impl Config {
         if clients == 0 || pipeline == 0 {
             usage();
         }
+        // Pipelined mode always sends GET regardless of `command` (see
+        // `run_client`'s doc comment on why) — but the report prints
+        // `config.command.name()` unconditionally. Silently accepting
+        // e.g. `--command set --pipeline 8` used to mean 100% of the
+        // traffic sent was GET while the report/CSV claimed
+        // `command=set` (found via code review). Rejecting the mismatch
+        // here, rather than trying to make pipelined mode respect an
+        // arbitrary command, keeps that guarantee true by construction:
+        // if this passed, `command` is always `GetOnly` from here on.
+        if pipeline > 1 && command != CommandMode::GetOnly {
+            eprintln!(
+                "error: --pipeline > 1 only supports --command get (pipelined mode always sends GET; pass --command get explicitly, or drop --pipeline)"
+            );
+            process::exit(1);
+        }
 
         Config {
             port: port.unwrap_or_else(|| usage()),
@@ -144,7 +160,7 @@ impl Config {
 /// pre-filling a million keys isn't worth the setup time it'd cost
 /// every single run.
 async fn prefill(
-    stream: &mut TcpStream,
+    stream: &mut Connection,
     workload: Workload,
     client_id: usize,
     payload: &[u8],
@@ -168,7 +184,7 @@ async fn prefill(
 }
 
 /// Sends one command and times the full round trip to its reply.
-async fn timed_command(stream: &mut TcpStream, parts: &[&[u8]]) -> io::Result<Duration> {
+async fn timed_command(stream: &mut Connection, parts: &[&[u8]]) -> io::Result<Duration> {
     let t0 = Instant::now();
     send_command(stream, parts).await?;
     read_reply(stream).await?;
@@ -205,12 +221,20 @@ struct RunParams {
 /// `barrier.wait()` — a barrier can only release once *every*
 /// registered participant has called `wait()`, and a client that
 /// panics before doing so can never satisfy that count.
+///
+/// The third slot is how long this client's post-barrier loop actually
+/// ran for (`Duration::ZERO` if it never got past connect/prefill) —
+/// `main` takes the max across every client as the real measured
+/// window for throughput, rather than the nominal `--duration-secs`
+/// (see `main`'s comment on why the nominal value overstates
+/// throughput whenever a batch/command is still in flight when the
+/// deadline arrives).
 async fn run_client(
     id: usize,
     addr: SocketAddr,
     params: RunParams,
     barrier: Arc<Barrier>,
-) -> (bool, Vec<Duration>) {
+) -> (bool, Vec<Duration>, Duration) {
     let RunParams {
         workload,
         payload_size,
@@ -221,16 +245,18 @@ async fn run_client(
     } = params;
 
     let mut stream = match TcpStream::connect(addr).await {
-        Ok(s) => s,
+        Ok(s) => {
+            s.set_nodelay(true).ok();
+            BufReader::new(s)
+        }
         Err(e) => {
             eprintln!("client {id}: connect failed: {e}");
             // Still register at the barrier so this failure can't
             // strand every other client waiting on it forever.
             barrier.wait().await;
-            return (false, Vec::new());
+            return (false, Vec::new(), Duration::ZERO);
         }
     };
-    stream.set_nodelay(true).ok();
     let payload = vec![b'x'; payload_size];
     // Distinct, deterministic seed per client so runs are reproducible
     // and no two clients draw the same "random" key sequence.
@@ -239,7 +265,7 @@ async fn run_client(
     if let Err(e) = prefill(&mut stream, workload, id, &payload).await {
         eprintln!("client {id}: prefill failed: {e}");
         barrier.wait().await;
-        return (false, Vec::new());
+        return (false, Vec::new(), Duration::ZERO);
     }
 
     // Every client starts its timed loop at the same instant, rather
@@ -305,6 +331,9 @@ async fn run_client(
         // alternating `SET`/`GET`) deliberately: what pipelining
         // demonstrates is round-trip amortization, not this project's
         // command mix, and mixing types here wouldn't change that.
+        // `Config::parse` enforces `command == GetOnly` whenever
+        // `pipeline > 1`, so this branch never silently sends something
+        // other than what the report ends up labeling it as.
         //
         // What gets recorded per reply is time-since-batch-dispatch,
         // not an isolated per-request round trip — pipelining doesn't
@@ -359,7 +388,20 @@ async fn run_client(
         }
     }
 
-    (succeeded, samples)
+    (succeeded, samples, start.elapsed())
+}
+
+/// Quotes a CSV field per RFC 4180 if it contains anything that would
+/// otherwise corrupt the column layout — a comma, a quote, or a
+/// newline. `--label` is free-form user input; left unescaped, a label
+/// containing a comma (e.g. "before, after fix") would silently split
+/// into extra columns for anything reading this output.
+fn csv_field(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
 }
 
 fn print_report(config: &Config, stats: &Stats) {
@@ -367,7 +409,7 @@ fn print_report(config: &Config, stats: &Stats) {
     if config.csv {
         println!(
             "{},{},{},{},{},{},{},{:.1},{:.3},{:.3},{:.3},{:.3},{:.3}",
-            config.label,
+            csv_field(&config.label),
             config.clients,
             config.workload.name(),
             config.command.name(),
@@ -432,10 +474,21 @@ async fn main() {
 
     let mut all_samples = Vec::new();
     let mut failed_clients = 0usize;
+    // Each client measures its own elapsed time from right after the
+    // barrier releases it (so setup/connect/prefill time never counts).
+    // The max across all of them — not `config.duration` — is the real
+    // measured window: a batch or command still in flight when a
+    // client's nominal deadline arrives is allowed to finish, so actual
+    // wall-clock time can run a bit past what was requested. Using the
+    // nominal value there (found via code review) overstates throughput
+    // by however much that overrun was, more so with larger
+    // `--pipeline` or a slower/more contended server.
+    let mut measured_window = Duration::ZERO;
     for handle in handles {
         match handle.await {
-            Ok((succeeded, samples)) => {
+            Ok((succeeded, samples, elapsed)) => {
                 all_samples.extend(samples);
+                measured_window = measured_window.max(elapsed);
                 if !succeeded {
                     failed_clients += 1;
                 }
@@ -448,6 +501,10 @@ async fn main() {
             }
         }
     }
+    // Only the post-warmup portion of that span should count toward
+    // throughput — matches `samples` itself, which only ever records
+    // latencies once `elapsed >= warmup` in `run_client`'s loops.
+    measured_window = measured_window.saturating_sub(config.warmup);
 
     // A dropped client shows up as a lower `count`/throughput number
     // with nothing else to distinguish "the server got slower" from
@@ -464,6 +521,27 @@ async fn main() {
         );
     }
 
-    let computed = stats::compute(all_samples, config.duration);
+    let computed = stats::compute(all_samples, measured_window);
     print_report(&config, &computed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn csv_field_passes_through_plain_labels_unquoted() {
+        assert_eq!(csv_field("baseline"), "baseline");
+        assert_eq!(csv_field(""), "");
+    }
+
+    #[test]
+    fn csv_field_quotes_and_escapes_a_label_containing_a_comma() {
+        assert_eq!(csv_field("before, after fix"), "\"before, after fix\"");
+    }
+
+    #[test]
+    fn csv_field_doubles_embedded_quotes() {
+        assert_eq!(csv_field("a \"tagged\" run"), "\"a \"\"tagged\"\" run\"");
+    }
 }

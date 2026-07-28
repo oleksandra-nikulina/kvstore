@@ -23,9 +23,45 @@
 //! see `Store::maybe_evict` — rather than trying to prevent it here,
 //! since preventing it would mean re-coupling the two locks and losing
 //! the reason this module exists.
+//!
+//! A second, related consequence worth being explicit about (found via
+//! code review): `Store::maybe_evict`'s `protect` argument only ever
+//! excludes *that specific call's own* key from being evicted — it
+//! stops a `SET` from evicting the value it's in the middle of writing,
+//! but it's not a durable reservation. A different connection's own
+//! concurrent write, if it triggers its own eviction pass in the
+//! window right after, is free to pick this connection's
+//! just-written key as its victim; `protect` was never meant to (and
+//! architecturally can't, without re-coupling the two locks) promise
+//! anything beyond "not evicted by the write that just created it."
+//! Whether that's actually surprising depends on the policy: under
+//! LRU it's a non-issue in practice, since [`Eviction::record_access`]
+//! makes a freshly-written key the *most* recently used — the very
+//! last candidate an LRU pass would offer. Under LFU it's sharper: a
+//! brand-new key starts at the lowest possible frequency, so it
+//! genuinely is "least frequently used" by definition and can be a
+//! prime eviction candidate moments after being written under
+//! concurrent load near `maxmemory`. That's arguably correct behavior
+//! for a frequency-based cache at capacity, not corruption or a lost
+//! write in the traditional sense — but a client doing a
+//! write-then-immediately-read on the same key, with no guarantee
+//! another connection isn't concurrently pushing the store over its
+//! cap, can observe the read miss. No durable per-key protection
+//! across connections is implemented for this; doing so would need
+//! either a per-key pin mechanism or re-coupling `Store`'s and
+//! `Eviction`'s locks, both of which would undo the reason this
+//! module is a separate lock in the first place.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{LockResult, Mutex};
+
+/// Takes a lock guard even if the lock was poisoned by a panic in some
+/// other critical section — see `store.rs`'s `recover()` for the full
+/// reasoning (identical here: every critical section in this module is
+/// a plain, infallible operation).
+fn recover<T>(result: LockResult<T>) -> T {
+    result.unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
@@ -234,7 +270,7 @@ impl Eviction {
     /// module's doc comment for why this is a separate lock from
     /// `Store`'s own, and the narrow race that decoupling accepts.
     pub fn record_access(&self, key: &str) {
-        match &mut *self.tracker.lock().unwrap() {
+        match &mut *recover(self.tracker.lock()) {
             Tracker::Lru(list) => list.touch(key),
             Tracker::Lfu(map) => map.touch(key),
         }
@@ -244,7 +280,7 @@ impl Eviction {
     /// by any means, so this tracker doesn't drift from the store's
     /// actual contents.
     pub fn forget(&self, key: &str) {
-        match &mut *self.tracker.lock().unwrap() {
+        match &mut *recover(self.tracker.lock()) {
             Tracker::Lru(list) => list.remove(key),
             Tracker::Lfu(map) => map.remove(key),
         }
@@ -256,7 +292,7 @@ impl Eviction {
     /// "exclude, not just check after the fact" is the part that
     /// actually matters here.
     pub fn evict_except(&self, protect: Option<&str>) -> Option<String> {
-        match &mut *self.tracker.lock().unwrap() {
+        match &mut *recover(self.tracker.lock()) {
             Tracker::Lru(list) => list.evict_except(protect),
             Tracker::Lfu(map) => map.evict_except(protect),
         }

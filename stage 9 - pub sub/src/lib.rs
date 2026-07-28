@@ -6,7 +6,7 @@ pub mod store;
 
 use command::{Command, ReadResult, aof_args, execute, read_command};
 use persistence::Aof;
-use pubsub::{PubSub, message_push, subscribe_ack};
+use pubsub::{CHANNEL_CAPACITY, PubSub, message_push, subscribe_ack};
 use resp::{Bytes, Reply};
 use std::collections::HashMap;
 use std::io;
@@ -15,10 +15,23 @@ use std::time::Duration;
 use store::Store;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Semaphore, broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 const SWEEP_INTERVAL: Duration = Duration::from_millis(100);
+
+/// The default cap on concurrent connections `run()` uses — same
+/// reasoning as stage 7/8's `tokio::sync::Semaphore`.
+const MAX_CONNECTIONS: usize = 1024;
+
+/// Caps how many channels a single connection can be subscribed to at
+/// once. Without this, a single pipelined `SUBSCRIBE ch1 ch2 ...` could
+/// name up to `MAX_MULTIBULK_LEN` (over a million) channels in one
+/// command — each one spawning a forwarder task and creating a
+/// broadcast group, all under one connection's single permit. Real
+/// usage needs nowhere near this many; the cap only ever bites a
+/// pathological or adversarial client.
+const MAX_SUBSCRIPTIONS_PER_CONNECTION: usize = 1000;
 
 /// Every command this connection is currently subscribed to, and the
 /// forwarder task relaying that channel's broadcast messages into this
@@ -72,17 +85,34 @@ async fn serve(
 ) -> io::Result<()> {
     let mut buf: Vec<u8> = Vec::new();
     let mut read_buf = [0u8; 4096];
-    let (push_tx, mut push_rx) = mpsc::unbounded_channel::<(String, Bytes)>();
+    // Bounded, matching `CHANNEL_CAPACITY`, not `unbounded_channel`: the
+    // broadcast channel each forwarder reads from is already bounded
+    // specifically so a slow subscriber can't accumulate unbounded
+    // memory (see `pubsub.rs`'s doc comment on `CHANNEL_CAPACITY`) — an
+    // unbounded channel here would silently erase that bound the moment
+    // a message crosses from the broadcast channel into this one. A
+    // slow-reading client now applies real backpressure: a full
+    // `push_tx` blocks the forwarder's `send`, which stops it from
+    // draining its broadcast receiver, which is exactly what lets that
+    // receiver's own bound (and `Lagged` reporting) take over instead
+    // of memory growing without limit.
+    let (push_tx, mut push_rx) = mpsc::channel::<(String, Bytes)>(CHANNEL_CAPACITY);
 
     loop {
         // Drain and dispatch every complete command already buffered —
         // same buffer-then-parse-repeatedly shape every earlier stage
         // used — before waiting for more input *or* a pushed message.
+        // `pos` tracks how much of `buf` is already consumed without
+        // physically removing it yet; compacting once per outer
+        // iteration (right before the `select!`) rather than once per
+        // command keeps this linear in bytes processed, not quadratic
+        // in a heavily pipelined batch's size.
+        let mut pos = 0;
         loop {
-            match read_command(&buf) {
+            match read_command(&buf[pos..]) {
                 Ok(ReadResult::Incomplete) => break,
                 Ok(ReadResult::Empty { consumed }) => {
-                    buf.drain(0..consumed);
+                    pos += consumed;
                 }
                 Ok(ReadResult::Command { command, consumed }) => {
                     dispatch(
@@ -95,7 +125,7 @@ async fn serve(
                         &push_tx,
                     )
                     .await?;
-                    buf.drain(0..consumed);
+                    pos += consumed;
                 }
                 Err(e) => {
                     let reply = Reply::Error(format!("ERR Protocol error: {e}"));
@@ -103,6 +133,9 @@ async fn serve(
                     return Ok(());
                 }
             }
+        }
+        if pos > 0 {
+            buf.drain(0..pos);
         }
 
         // The one new idea this stage adds to every earlier
@@ -114,8 +147,20 @@ async fn serve(
         tokio::select! {
             maybe_push = push_rx.recv() => {
                 if let Some((channel, payload)) = maybe_push {
-                    let reply = message_push(&channel, &payload);
-                    stream.write_all(&reply.encode()).await?;
+                    // A message for `channel` can already be sitting in
+                    // `push_rx`'s queue at the moment this connection
+                    // unsubscribes from it: `handle.abort()` stops the
+                    // forwarder from pulling any *more* messages, but
+                    // does nothing to reach back into the queue for one
+                    // it already handed off before the abort landed.
+                    // Re-checking membership here — not just aborting
+                    // the forwarder — is what actually prevents a
+                    // message arriving after this connection's own
+                    // UNSUBSCRIBE ack was already sent for that channel.
+                    if subscriptions.contains_key(&channel) {
+                        let reply = message_push(&channel, &payload);
+                        stream.write_all(&reply.encode()).await?;
+                    }
                 }
             }
             read_result = stream.read(&mut read_buf) => {
@@ -144,7 +189,7 @@ async fn dispatch(
     aof: &Aof,
     pubsub: &PubSub,
     subscriptions: &mut Subscriptions,
-    push_tx: &mpsc::UnboundedSender<(String, Bytes)>,
+    push_tx: &mpsc::Sender<(String, Bytes)>,
 ) -> io::Result<()> {
     let in_subscribe_mode = !subscriptions.is_empty();
     let allowed_while_subscribed = matches!(
@@ -162,6 +207,13 @@ async fn dispatch(
         Command::Subscribe(channels) => {
             for channel in channels {
                 if !subscriptions.contains_key(channel) {
+                    if subscriptions.len() >= MAX_SUBSCRIPTIONS_PER_CONNECTION {
+                        let reply = Reply::Error(format!(
+                            "ERR too many subscriptions on this connection (max {MAX_SUBSCRIPTIONS_PER_CONNECTION})"
+                        ));
+                        stream.write_all(&reply.encode()).await?;
+                        continue;
+                    }
                     let handle = spawn_forwarder(pubsub, channel, push_tx.clone());
                     subscriptions.insert(channel.clone(), handle);
                 }
@@ -225,14 +277,21 @@ async fn dispatch(
 fn spawn_forwarder(
     pubsub: &PubSub,
     channel: &str,
-    push_tx: mpsc::UnboundedSender<(String, Bytes)>,
+    push_tx: mpsc::Sender<(String, Bytes)>,
 ) -> JoinHandle<()> {
     let mut rx = pubsub.subscribe(channel);
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(message) => {
-                    if push_tx.send(message).is_err() {
+                    // Awaiting a bounded `send` is the actual
+                    // backpressure mechanism: if `serve()`'s consumer
+                    // side is slow, this blocks here instead of
+                    // draining `rx` further, so the broadcast channel's
+                    // own bound (and `Lagged` reporting) absorbs a slow
+                    // reader rather than this task buffering unbounded
+                    // messages on its behalf.
+                    if push_tx.send(message).await.is_err() {
                         // The connection's serve() loop is gone.
                         break;
                     }
@@ -252,13 +311,17 @@ fn spawn_forwarder(
 
 /// Accepts connections forever, one `tokio` task per connection, all
 /// sharing one `Store`, one `Aof`, and one `PubSub` registry — plus the
-/// background expiry sweep from stage 7/8, unchanged.
+/// background expiry sweep from stage 7/8, unchanged. Caps concurrent
+/// connections at [`MAX_CONNECTIONS`]; see stage 2's `run_with_limit`
+/// notes for why a cap exists at all.
 pub async fn run(
     listener: TcpListener,
     store: Arc<Store>,
     aof: Arc<Aof>,
     pubsub: Arc<PubSub>,
 ) -> io::Result<()> {
+    let semaphore = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+
     {
         let store = Arc::clone(&store);
         tokio::spawn(async move {
@@ -270,11 +333,25 @@ pub async fn run(
     }
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                eprintln!("accept error: {e}");
+                // A persistently failing accept() would otherwise
+                // busy-spin this loop.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let store = Arc::clone(&store);
         let aof = Arc::clone(&aof);
         let pubsub = Arc::clone(&pubsub);
+        let permit = Arc::clone(&semaphore)
+            .acquire_owned()
+            .await
+            .expect("semaphore is never closed");
         tokio::spawn(async move {
+            let _permit = permit; // held for the connection's whole lifetime
             if let Err(e) = handle_connection(stream, store, aof, pubsub).await {
                 eprintln!("connection error: {e}");
             }

@@ -16,8 +16,16 @@
 
 use crate::resp::{Bytes, Reply};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{LockResult, Mutex};
 use tokio::sync::broadcast;
+
+/// Takes a lock guard even if the lock was poisoned by a panic in some
+/// other critical section — see `store.rs`'s `recover()` for the full
+/// reasoning (identical here: every critical section in this module is
+/// a plain, infallible operation).
+fn recover<T>(result: LockResult<T>) -> T {
+    result.unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Bounded per-channel buffer: a subscriber that falls more than this
 /// many messages behind a publisher misses the oldest ones — it learns
@@ -25,7 +33,7 @@ use tokio::sync::broadcast;
 /// task) rather than the buffer growing without bound to hold every
 /// message for every slow subscriber forever. A genuine trade-off of
 /// the broadcast-channel pattern, not an arbitrary number.
-const CHANNEL_CAPACITY: usize = 128;
+pub(crate) const CHANNEL_CAPACITY: usize = 128;
 
 pub struct PubSub {
     channels: Mutex<HashMap<String, broadcast::Sender<(String, Bytes)>>>,
@@ -41,7 +49,7 @@ impl PubSub {
     /// Subscribes to `channel`, creating its broadcast group if this is
     /// the first subscriber.
     pub fn subscribe(&self, channel: &str) -> broadcast::Receiver<(String, Bytes)> {
-        let mut channels = self.channels.lock().unwrap();
+        let mut channels = recover(self.channels.lock());
         let sender = channels
             .entry(channel.to_string())
             .or_insert_with(|| broadcast::channel(CHANNEL_CAPACITY).0);
@@ -53,7 +61,7 @@ impl PubSub {
     /// connection close — without this, every channel ever subscribed
     /// to would sit in the map forever with zero live receivers.
     pub fn cleanup_if_unused(&self, channel: &str) {
-        let mut channels = self.channels.lock().unwrap();
+        let mut channels = recover(self.channels.lock());
         if channels
             .get(channel)
             .is_some_and(|sender| sender.receiver_count() == 0)
@@ -67,7 +75,7 @@ impl PubSub {
     /// an error and doesn't create an entry in the map: matches real
     /// `PUBLISH`, which is perfectly happy to shout into an empty room.
     pub fn publish(&self, channel: &str, message: Bytes) -> usize {
-        let channels = self.channels.lock().unwrap();
+        let channels = recover(self.channels.lock());
         match channels.get(channel) {
             Some(sender) => sender.send((channel.to_string(), message)).unwrap_or(0),
             None => 0,
@@ -81,7 +89,7 @@ impl PubSub {
     /// this via `PUBSUB CHANNELS`/`PUBSUB NUMSUB`, which this project
     /// doesn't implement).
     pub fn channel_count(&self) -> usize {
-        self.channels.lock().unwrap().len()
+        recover(self.channels.lock()).len()
     }
 }
 
